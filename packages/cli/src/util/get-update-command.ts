@@ -1,8 +1,9 @@
-import { Stats } from 'fs';
+import { Stats } from 'fs-extra';
 import { sep, dirname, join, resolve } from 'path';
-import { lstat, readlink, readFile, realpath } from 'fs-extra';
+import { lstat, readlink, readFile, pathExists, realpath } from 'fs-extra';
 import { isCanary } from './is-canary';
 import { getPkgName } from './pkg-name';
+import execa from 'execa';
 
 async function isYarn(): Promise<boolean> {
   let s: Stats;
@@ -24,6 +25,13 @@ async function isYarn(): Promise<boolean> {
    * "/usr/local/share/.config/yarn/global/node_modules/vercel/package.json"
    */
   return pkgPath.includes(join('yarn', 'global'));
+}
+
+async function isPnpm(): Promise<boolean> {
+  const { stdout: pnpmPath } = await execa('pnpm', ['root', '-g']);
+
+  const hasVercel = await pathExists(join(pnpmPath, 'vercel'));
+  return hasVercel;
 }
 
 async function getConfigPrefix() {
@@ -101,6 +109,8 @@ export default async function getUpdateCommand(): Promise<string> {
   if (await isGlobal()) {
     return (await isYarn())
       ? `yarn global add ${pkgAndVersion}`
+      : (await isPnpm())
+      ? `pnpm i -g ${pkgAndVersion}`
       : `npm i -g ${pkgAndVersion}`;
   }
 
