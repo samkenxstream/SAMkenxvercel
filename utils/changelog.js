@@ -9,11 +9,26 @@ const groupLog = require('./changelog/group');
 process.chdir(join(__dirname, '..'));
 
 async function getLatestStableTag() {
+  const headers = {};
+
+  const token = process.env.GITHUB_TOKEN;
+  if (token) {
+    headers['authorization'] = `token ${token}`;
+  }
+
   const res = await fetch(
-    'https://api.github.com/repos/vercel/vercel/releases/latest'
+    'https://api.github.com/repos/vercel/vercel/releases/latest',
+    {
+      headers,
+    }
   );
-  const { tag_name } = await res.json();
-  return tag_name;
+  const result = await res.json();
+  if (!result.tag_name) {
+    const message = result.message || JSON.stringify(result);
+    throw new Error(`Failed to fetch releases from github: ${message}`);
+  }
+
+  return result.tag_name;
 }
 
 function serializeLog(groupedLog) {
@@ -90,7 +105,7 @@ async function main() {
   const pub = Array.from(pkgs).join(',');
   console.log('To publish a stable release, execute the following:');
   console.log(
-    `\nnpx lerna version --message "Publish Stable" --exact --force-publish=${pub}\n`
+    `\npnpx lerna version --message "Publish Stable" --exact --no-private --force-publish=${pub}\n`
   );
 }
 

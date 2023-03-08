@@ -10,6 +10,7 @@ import {
   download,
   getLambdaOptionsFromFunction,
   getNodeVersion,
+  getPrefixedEnvVars,
   getSpawnOptions,
   getScriptName,
   glob,
@@ -23,8 +24,9 @@ import {
   PrepareCache,
   NodejsLambda,
   BuildResultV2Typical as BuildResult,
+  BuildResultBuildOutput,
 } from '@vercel/build-utils';
-import { Handler, Route, Source } from '@vercel/routing-utils';
+import { Route, RouteWithHandle, RouteWithSrc } from '@vercel/routing-utils';
 import {
   convertHeaders,
   convertRedirects,
@@ -35,8 +37,14 @@ import { Sema } from 'async-sema';
 // escape-string-regexp version must match Next.js version
 import escapeStringRegexp from 'escape-string-regexp';
 import findUp from 'find-up';
-import { lstat, pathExists, readFile, remove, writeFile } from 'fs-extra';
-import os from 'os';
+import {
+  lstat,
+  pathExists,
+  readFile,
+  readJSON,
+  remove,
+  writeFile,
+} from 'fs-extra';
 import path from 'path';
 import resolveFrom from 'resolve-from';
 import semver from 'semver';
@@ -45,6 +53,7 @@ import createServerlessConfig from './create-serverless-config';
 import nextLegacyVersions from './legacy-versions';
 import { serverBuild } from './server-build';
 import {
+  MIB,
   collectTracedFiles,
   createLambdaFromPseudoLayers,
   createPseudoLayer,
@@ -56,6 +65,7 @@ import {
   getExportIntent,
   getExportStatus,
   getFilesMapFromReasons,
+  getImagesConfig,
   getImagesManifest,
   getMiddlewareManifest,
   getNextConfig,
@@ -78,6 +88,8 @@ import {
   PseudoLayerResult,
   updateRouteSrc,
   validateEntrypoint,
+  getOperationType,
+  isApiPage,
 } from './utils';
 
 export const version = 2;
@@ -193,7 +205,7 @@ export const build: BuildV2 = async ({
 
   // Limit for max size each lambda can be, 50 MB if no custom limit
   const lambdaCompressedByteLimit = (config.maxLambdaSize ||
-    50 * 1000 * 1000) as number;
+    50 * MIB) as number;
 
   let entryDirectory = path.dirname(entrypoint);
   let entryPath = path.join(workPath, entryDirectory);
@@ -203,7 +215,7 @@ export const build: BuildV2 = async ({
     repoRootPath = entryPath;
     entryPath = path.join(entryPath, config.rootDirectory as string);
   }
-  const outputDirectory = config.outputDirectory || '.next';
+  const outputDirectory = path.join('./', config.outputDirectory || '.next');
   const dotNextStatic = path.join(entryPath, outputDirectory, 'static');
   // TODO: remove after testing used for simulating root directory monorepo
   // setting that can't be triggered with vercel.json
@@ -224,14 +236,14 @@ export const build: BuildV2 = async ({
     )
   );
 
-  Object.keys(process.env)
-    .filter(key => key.startsWith('VERCEL_'))
-    .forEach(key => {
-      const newKey = `NEXT_PUBLIC_${key}`;
-      if (!(newKey in process.env)) {
-        process.env[newKey] = process.env[key];
-      }
-    });
+  const prefixedEnvs = getPrefixedEnvVars({
+    envPrefix: 'NEXT_PUBLIC_',
+    envs: process.env,
+  });
+
+  for (const [key, value] of Object.entries(prefixedEnvs)) {
+    process.env[key] = value;
+  }
 
   await download(files, workPath, meta);
 
@@ -397,8 +409,8 @@ export const build: BuildV2 = async ({
   }
 
   const env: typeof process.env = { ...spawnOpts.env };
-  const memoryToConsume = Math.floor(os.totalmem() / 1024 ** 2) - 128;
-  env.NODE_OPTIONS = `--max_old_space_size=${memoryToConsume}`;
+  env.NEXT_EDGE_RUNTIME_PROVIDER = 'vercel';
+  env.NEXT_PUBLIC_EDGE_RUNTIME_PROVIDER = env.NEXT_EDGE_RUNTIME_PROVIDER;
 
   if (target) {
     // Since version v10.0.8-canary.15 of Next.js the NEXT_PRIVATE_TARGET env
@@ -406,8 +418,13 @@ export const build: BuildV2 = async ({
     // this helps us catch cases where we can't locate the next.config.js
     // correctly
     env.NEXT_PRIVATE_TARGET = target;
+    env.NEXT_PUBLIC_TARGET = target;
   }
+  // Only NEXT_PUBLIC_ is considered for turbo/nx cache keys
+  // and caches may not have the correct trace root so we
+  // need to ensure this included in the cache key
   env.NEXT_PRIVATE_OUTPUT_TRACE_ROOT = baseDir;
+  env.NEXT_PUBLIC_OUTPUT_TRACE_ROOT = baseDir;
 
   if (isServerMode) {
     // when testing with jest NODE_ENV will be set to test so ensure
@@ -443,6 +460,24 @@ export const build: BuildV2 = async ({
   }
   debug('build command exited');
 
+  let buildOutputVersion: undefined | number;
+
+  try {
+    const data = await readJSON(
+      path.join(outputDirectory, 'output/config.json')
+    );
+    buildOutputVersion = data.version;
+  } catch (_) {
+    // tolerate for older versions
+  }
+
+  if (buildOutputVersion) {
+    return {
+      buildOutputPath: path.join(outputDirectory, 'output'),
+      buildOutputVersion,
+    } as BuildResultBuildOutput;
+  }
+
   let appMountPrefixNoTrailingSlash = path.posix
     .join('/', entryDirectory)
     .replace(/\/+$/, '');
@@ -473,6 +508,14 @@ export const build: BuildV2 = async ({
         ? // eslint-disable-next-line @typescript-eslint/no-non-null-asserted-optional-chain
           path.join('/', routesManifest?.i18n!.defaultLocale!, '/404')
         : '/404'
+    ]?.initialRevalidate === 'number';
+
+  const hasIsr500Page =
+    typeof prerenderManifest.staticRoutes[
+      routesManifest?.i18n
+        ? // eslint-disable-next-line @typescript-eslint/no-non-null-asserted-optional-chain
+          path.join('/', routesManifest?.i18n!.defaultLocale!, '/500')
+        : '/500'
     ]?.initialRevalidate === 'number';
 
   const wildcardConfig: BuildResult['wildcard'] =
@@ -658,7 +701,7 @@ export const build: BuildV2 = async ({
     }
   }
 
-  let dynamicPrefix = path.join('/', entryDirectory);
+  let dynamicPrefix = path.posix.join('/', entryDirectory);
   dynamicPrefix = dynamicPrefix === '/' ? '' : dynamicPrefix;
 
   if (imagesManifest) {
@@ -710,7 +753,7 @@ export const build: BuildV2 = async ({
           throw new NowBuildError({
             code: 'NEXT_IMAGES_DANGEROUSLYALLOWSVG',
             message:
-              'image-manifest.json "images.dangerouslyAllowSVG" must be an boolean. Contact support if this continues to happen.',
+              'image-manifest.json "images.dangerouslyAllowSVG" must be a boolean. Contact support if this continues to happen.',
           });
         }
         if (
@@ -720,7 +763,7 @@ export const build: BuildV2 = async ({
           throw new NowBuildError({
             code: 'NEXT_IMAGES_CONTENTSECURITYPOLICY',
             message:
-              'image-manifest.json "images.contentSecurityPolicy" must be an string. Contact support if this continues to happen.',
+              'image-manifest.json "images.contentSecurityPolicy" must be a string. Contact support if this continues to happen.',
           });
         }
         break;
@@ -782,20 +825,13 @@ export const build: BuildV2 = async ({
         }
       });
 
+    console.log(
+      'Notice: detected `next export`, this de-opts some Next.js features\nSee more info: https://nextjs.org/docs/advanced-features/static-html-export'
+    );
+
     return {
       output,
-      images:
-        imagesManifest?.images?.loader === 'default'
-          ? {
-              domains: imagesManifest.images.domains,
-              sizes: imagesManifest.images.sizes,
-              remotePatterns: imagesManifest.images.remotePatterns,
-              minimumCacheTTL: imagesManifest.images.minimumCacheTTL,
-              dangerouslyAllowSVG: imagesManifest.images.dangerouslyAllowSVG,
-              contentSecurityPolicy:
-                imagesManifest.images.contentSecurityPolicy,
-            }
-          : undefined,
+      images: getImagesConfig(imagesManifest),
       routes: [
         ...privateOutputs.routes,
 
@@ -807,7 +843,7 @@ export const build: BuildV2 = async ({
 
         // Make sure to 404 for the /404 path itself
         {
-          src: path.join('/', entryDirectory, '404/?'),
+          src: path.posix.join('/', entryDirectory, '404/?'),
           status: 404,
           continue: true,
         },
@@ -821,7 +857,7 @@ export const build: BuildV2 = async ({
         ...(routesManifest?.basePath
           ? [
               {
-                src: path.join('/', entryDirectory, '_next/image/?'),
+                src: path.posix.join('/', entryDirectory, '_next/image/?'),
                 dest: '/_next/image',
                 check: true,
               },
@@ -831,12 +867,12 @@ export const build: BuildV2 = async ({
         // No-op _next/data rewrite to trigger handle: 'rewrites' and then 404
         // if no match to prevent rewriting _next/data unexpectedly
         {
-          src: path.join('/', entryDirectory, '_next/data/(.*)'),
-          dest: path.join('/', entryDirectory, '_next/data/$1'),
+          src: path.posix.join('/', entryDirectory, '_next/data/(.*)'),
+          dest: path.posix.join('/', entryDirectory, '_next/data/$1'),
           check: true,
         },
         {
-          src: path.join('/', entryDirectory, '_next/data/(.*)'),
+          src: path.posix.join('/', entryDirectory, '_next/data/(.*)'),
           status: 404,
         },
 
@@ -850,14 +886,14 @@ export const build: BuildV2 = async ({
 
         ...fallbackRewrites,
 
-        { src: path.join('/', entryDirectory, '.*'), status: 404 },
+        { src: path.posix.join('/', entryDirectory, '.*'), status: 404 },
 
         // We need to make sure to 404 for /_next after handle: miss since
         // handle: miss is called before rewrites and to prevent rewriting
         // /_next
         { handle: 'miss' },
         {
-          src: path.join(
+          src: path.posix.join(
             '/',
             entryDirectory,
             '_next/static/(?:[^/]+/pages|pages|chunks|runtime|css|image|media)/.+'
@@ -877,7 +913,7 @@ export const build: BuildV2 = async ({
         {
           // This ensures we only match known emitted-by-Next.js files and not
           // user-emitted files which may be missing a hash in their filename.
-          src: path.join(
+          src: path.posix.join(
             '/',
             entryDirectory,
             `_next/static/(?:[^/]+/pages|pages|chunks|runtime|css|image|media|${escapedBuildId})/.+`
@@ -892,19 +928,20 @@ export const build: BuildV2 = async ({
         },
 
         // error handling
-        ...(output[path.join('./', entryDirectory, '404')] ||
-        output[path.join('./', entryDirectory, '404/index')]
+        ...(output[path.posix.join('./', entryDirectory, '404')] ||
+        output[path.posix.join('./', entryDirectory, '404/index')]
           ? [
-              { handle: 'error' } as Handler,
+              { handle: 'error' } as RouteWithHandle,
 
               {
                 status: 404,
-                src: path.join(entryDirectory, '.*'),
-                dest: path.join('/', entryDirectory, '404'),
+                src: path.posix.join(entryDirectory, '.*'),
+                dest: path.posix.join('/', entryDirectory, '404'),
               },
             ]
           : []),
       ],
+      framework: { version: nextVersion },
     };
   }
 
@@ -927,7 +964,7 @@ export const build: BuildV2 = async ({
   let trailingSlash = false;
 
   redirects = redirects.filter(_redir => {
-    const redir = _redir as Source;
+    const redir = _redir as RouteWithSrc;
     // detect the trailing slash redirect and make sure it's
     // kept above the wildcard mapping to prevent erroneous redirects
     // since non-continue routes come after continue the $wildcard
@@ -994,7 +1031,7 @@ export const build: BuildV2 = async ({
       buildId,
       'pages'
     );
-    const pages = await getServerlessPages({
+    const { pages } = await getServerlessPages({
       pagesDir,
       entryPath,
       outputDirectory,
@@ -1046,7 +1083,7 @@ export const build: BuildV2 = async ({
         }
 
         debug(`Creating serverless function for page: "${page}"...`);
-        lambdas[path.join(entryDirectory, pathname)] = new NodejsLambda({
+        lambdas[path.posix.join(entryDirectory, pathname)] = new NodejsLambda({
           files: {
             ...nextFiles,
             ...pageFiles,
@@ -1055,9 +1092,14 @@ export const build: BuildV2 = async ({
           handler: '___next_launcher.cjs',
           runtime: nodeVersion.runtime,
           ...lambdaOptions,
+          operationType: 'SSR', // always SSR because we're in legacy mode
           shouldAddHelpers: false,
           shouldAddSourcemapSupport: false,
           supportsMultiPayloads: !!process.env.NEXT_PRIVATE_MULTI_PAYLOAD,
+          framework: {
+            slug: 'nextjs',
+            version: nextVersion,
+          },
         });
         debug(`Created serverless function for page: "${page}"`);
       })
@@ -1071,15 +1113,21 @@ export const build: BuildV2 = async ({
       'pages'
     );
 
-    const pages = await getServerlessPages({
+    let appDir: string | null = null;
+    const appPathRoutesManifest = await readJSON(
+      path.join(entryPath, outputDirectory, 'app-path-routes-manifest.json')
+    ).catch(() => null);
+
+    if (appPathRoutesManifest) {
+      appDir = path.join(pagesDir, '../app');
+    }
+
+    const { pages, appPaths: lambdaAppPaths } = await getServerlessPages({
       pagesDir,
       entryPath,
       outputDirectory,
+      appPathRoutesManifest,
     });
-    const isApiPage = (page: string) =>
-      page
-        .replace(/\\/g, '/')
-        .match(/(serverless|server)\/pages\/api(\/|\.js$)/);
 
     const canUsePreviewMode = Object.keys(pages).some(page =>
       isApiPage(pages[page].fsPath)
@@ -1092,30 +1140,32 @@ export const build: BuildV2 = async ({
       prerenderManifest,
       routesManifest
     );
-    hasStatic500 = !!staticPages[path.join(entryDirectory, '500')];
+    hasStatic500 = !!staticPages[path.posix.join(entryDirectory, '500')];
 
     // this can be either 404.html in latest versions
     // or _errors/404.html versions while this was experimental
     static404Page =
-      staticPages[path.join(entryDirectory, '404')] && hasPages404
-        ? path.join(entryDirectory, '404')
-        : staticPages[path.join(entryDirectory, '_errors/404')]
-        ? path.join(entryDirectory, '_errors/404')
+      staticPages[path.posix.join(entryDirectory, '404')] && hasPages404
+        ? path.posix.join(entryDirectory, '404')
+        : staticPages[path.posix.join(entryDirectory, '_errors/404')]
+        ? path.posix.join(entryDirectory, '_errors/404')
         : undefined;
 
     const { i18n } = routesManifest || {};
 
     if (!static404Page && i18n) {
       static404Page = staticPages[
-        path.join(entryDirectory, i18n.defaultLocale, '404')
+        path.posix.join(entryDirectory, i18n.defaultLocale, '404')
       ]
-        ? path.join(entryDirectory, i18n.defaultLocale, '404')
+        ? path.posix.join(entryDirectory, i18n.defaultLocale, '404')
         : undefined;
     }
 
     if (!hasStatic500 && i18n) {
       hasStatic500 =
-        !!staticPages[path.join(entryDirectory, i18n.defaultLocale, '500')];
+        !!staticPages[
+          path.posix.join(entryDirectory, i18n.defaultLocale, '500')
+        ];
     }
 
     if (routesManifest) {
@@ -1145,11 +1195,11 @@ export const build: BuildV2 = async ({
                 continue;
               }
 
-              const route: Source & { dest: string } = {
+              const route: RouteWithSrc & { dest: string } = {
                 src: (
                   dataRoute.namedDataRouteRegex || dataRoute.dataRouteRegex
                 ).replace(/^\^/, `^${appMountPrefixNoTrailingSlash}`),
-                dest: path.join(
+                dest: path.posix.join(
                   '/',
                   entryDirectory,
                   // make sure to route SSG data route to the data prerender
@@ -1174,7 +1224,7 @@ export const build: BuildV2 = async ({
               if (isOmittedRoute && isServerMode) {
                 // only match this route when in preview mode so
                 // preview works for non-prerender fallback: false pages
-                (route as Source).has = [
+                (route as RouteWithSrc).has = [
                   {
                     type: 'cookie',
                     key: '__prerender_bypass',
@@ -1263,10 +1313,12 @@ export const build: BuildV2 = async ({
         config,
         nextVersion,
         trailingSlash,
+        appPathRoutesManifest,
         dynamicPages,
         canUsePreviewMode,
         staticPages,
         lambdaPages: pages,
+        lambdaAppPaths,
         omittedPrerenderRoutes,
         isCorrectLocaleAPIRoutes,
         pagesDir,
@@ -1294,6 +1346,7 @@ export const build: BuildV2 = async ({
         requiredServerFilesManifest,
         privateOutputs,
         hasIsr404Page,
+        hasIsr500Page,
       });
     }
 
@@ -1543,6 +1596,10 @@ export const build: BuildV2 = async ({
         internalPages: [],
       });
 
+      for (const group of initialApiLambdaGroups) {
+        group.isApiLambda = true;
+      }
+
       debug(
         JSON.stringify(
           {
@@ -1764,7 +1821,12 @@ export const build: BuildV2 = async ({
                 path.relative(baseDir, entryPath),
                 '___next_launcher.cjs'
               ),
+              operationType: getOperationType({
+                prerenderManifest,
+                pageFileName,
+              }),
               runtime: nodeVersion.runtime,
+              nextVersion,
               ...lambdaOptions,
             });
           } else {
@@ -1783,7 +1845,9 @@ export const build: BuildV2 = async ({
                 path.relative(baseDir, entryPath),
                 '___next_launcher.cjs'
               ),
+              operationType: getOperationType({ pageFileName }), // can only be API or SSR
               runtime: nodeVersion.runtime,
+              nextVersion,
               ...lambdaOptions,
             });
           }
@@ -1983,6 +2047,11 @@ export const build: BuildV2 = async ({
               pageLambdaMap[page] = group.lambdaIdentifier;
             }
 
+            const operationType = getOperationType({
+              group,
+              prerenderManifest,
+            });
+
             lambdas[group.lambdaIdentifier] =
               await createLambdaFromPseudoLayers({
                 files: {
@@ -1994,7 +2063,9 @@ export const build: BuildV2 = async ({
                   path.relative(baseDir, entryPath),
                   '___next_launcher.cjs'
                 ),
+                operationType,
                 runtime: nodeVersion.runtime,
+                nextVersion,
               });
           }
         )
@@ -2005,9 +2076,10 @@ export const build: BuildV2 = async ({
       console.timeEnd(allLambdasLabel);
     }
     const prerenderRoute = onPrerenderRoute({
+      appDir,
+      pagesDir,
       hasPages404,
       static404Page,
-      pagesDir,
       pageLambdaMap,
       lambdas,
       isServerMode,
@@ -2015,6 +2087,7 @@ export const build: BuildV2 = async ({
       entryDirectory,
       routesManifest,
       prerenderManifest,
+      appPathRoutesManifest,
       isSharedLambdas,
       canUsePreviewMode,
     });
@@ -2043,6 +2116,8 @@ export const build: BuildV2 = async ({
         ...Object.entries(prerenderManifest.fallbackRoutes),
         ...Object.entries(prerenderManifest.blockingFallbackRoutes),
       ].forEach(([, { dataRouteRegex, dataRoute }]) => {
+        if (!dataRoute || !dataRouteRegex) return;
+
         dataRoutes.push({
           // Next.js provided data route regex
           src: dataRouteRegex.replace(
@@ -2134,17 +2209,7 @@ export const build: BuildV2 = async ({
       ...privateOutputs.files,
     },
     wildcard: wildcardConfig,
-    images:
-      imagesManifest?.images?.loader === 'default'
-        ? {
-            domains: imagesManifest.images.domains,
-            sizes: imagesManifest.images.sizes,
-            remotePatterns: imagesManifest.images.remotePatterns,
-            minimumCacheTTL: imagesManifest.images.minimumCacheTTL,
-            dangerouslyAllowSVG: imagesManifest.images.dangerouslyAllowSVG,
-            contentSecurityPolicy: imagesManifest.images.contentSecurityPolicy,
-          }
-        : undefined,
+    images: getImagesConfig(imagesManifest),
     /*
       Desired routes order
       - Runtime headers
@@ -2453,7 +2518,7 @@ export const build: BuildV2 = async ({
         ? []
         : [
             // Custom Next.js 404 page
-            { handle: 'error' } as Handler,
+            { handle: 'error' } as RouteWithHandle,
 
             ...(i18n && (static404Page || hasIsr404Page)
               ? [
@@ -2546,6 +2611,7 @@ export const build: BuildV2 = async ({
                 ]),
           ]),
     ],
+    framework: { version: nextVersion },
   };
 };
 
@@ -2558,7 +2624,7 @@ export const prepareCache: PrepareCache = async ({
   debug('Preparing cache...');
   const entryDirectory = path.dirname(entrypoint);
   const entryPath = path.join(workPath, entryDirectory);
-  const outputDirectory = config.outputDirectory || '.next';
+  const outputDirectory = path.join('./', config.outputDirectory || '.next');
 
   const nextVersionRange = await getNextVersionRange(entryPath);
   const isLegacy = nextVersionRange && isLegacyNext(nextVersionRange);
@@ -2595,18 +2661,45 @@ async function getServerlessPages(params: {
   pagesDir: string;
   entryPath: string;
   outputDirectory: string;
+  appPathRoutesManifest?: Record<string, string>;
 }) {
-  const [pages, middlewareManifest] = await Promise.all([
+  const [pages, appPaths, middlewareManifest] = await Promise.all([
     glob('**/!(_middleware).js', params.pagesDir),
+    params.appPathRoutesManifest
+      ? Promise.all([
+          glob('**/page.js', path.join(params.pagesDir, '../app')),
+          glob('**/route.js', path.join(params.pagesDir, '../app')),
+        ]).then(items => Object.assign(...items))
+      : Promise.resolve({}),
     getMiddlewareManifest(params.entryPath, params.outputDirectory),
   ]);
+
+  const normalizedAppPaths: typeof appPaths = {};
+
+  if (params.appPathRoutesManifest) {
+    for (const [entry, normalizedEntry] of Object.entries(
+      params.appPathRoutesManifest
+    )) {
+      const normalizedPath = `${path.join(
+        '.',
+        normalizedEntry === '/' ? '/index' : normalizedEntry
+      )}.js`;
+      const globPath = `${path.join('.', entry)}.js`;
+
+      if (appPaths[globPath]) {
+        normalizedAppPaths[normalizedPath] = appPaths[globPath];
+      }
+    }
+  }
 
   // Edge Functions do not consider as Serverless Functions
   for (const edgeFunctionFile of Object.keys(
     middlewareManifest?.functions ?? {}
   )) {
-    delete pages[edgeFunctionFile.slice(1) + '.js'];
+    const edgePath = (edgeFunctionFile.slice(1) || 'index') + '.js';
+    delete normalizedAppPaths[edgePath];
+    delete pages[edgePath];
   }
 
-  return pages;
+  return { pages, appPaths: normalizedAppPaths };
 }
