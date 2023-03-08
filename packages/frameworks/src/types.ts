@@ -2,15 +2,24 @@ import { Rewrite, Route } from '@vercel/routing-utils';
 
 export interface FrameworkDetectionItem {
   /**
-   * A file path
-   * @example "package.json"
+   * A file path to detect.
+   * If specified, "matchPackage" cannot be specified.
+   * @example "some-framework.config.json"
    */
-  path: string;
+  path?: string;
   /**
-   * A matcher
+   * A matcher for the entire file.
+   * If specified, "matchPackage" cannot be specified.
    * @example "\"(dev)?(d|D)ependencies\":\\s*{[^}]*\"next\":\\s*\".+?\"[^}]*}"
    */
   matchContent?: string;
+  /**
+   * A matcher for a package specifically found in a "package.json" file.
+   * If specified, "path" and "matchContext" cannot be specified.
+   * If specified in multiple detectors, the first one will be used to resolve the framework version.
+   * @example "\"(dev)?(d|D)ependencies\":\\s*{[^}]*\"next\":\\s*\".+?\"[^}]*}"
+   */
+  matchPackage?: string;
 }
 
 export interface SettingPlaceholder {
@@ -53,12 +62,12 @@ export interface Framework {
   slug: string | null;
   /**
    * A URL to the logo of the framework
-   * @example "https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/next.svg"
+   * @example "https://api-frameworks.vercel.sh/framework-logos/next.svg"
    */
   logo: string;
   /**
    * An additional URL to the logo of the framework optimized for dark mode
-   * @example "https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/next-dark.svg"
+   * @example "https://api-frameworks.vercel.sh/framework-logos/next-dark.svg"
    */
   darkModeLogo?: string;
   /**

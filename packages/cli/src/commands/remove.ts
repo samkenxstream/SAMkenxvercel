@@ -11,17 +11,19 @@ import getScope from '../util/get-scope';
 import { isValidName } from '../util/is-valid-name';
 import removeProject from '../util/projects/remove-project';
 import getProjectByIdOrName from '../util/projects/get-project-by-id-or-name';
-import getDeploymentByIdOrHost from '../util/deploy/get-deployment-by-id-or-host';
-import getDeploymentsByProjectId, {
-  DeploymentPartial,
-} from '../util/deploy/get-deployments-by-project-id';
+import getDeployment from '../util/get-deployment';
+import getDeploymentsByProjectId from '../util/deploy/get-deployments-by-project-id';
 import { getPkgName, getCommandName } from '../util/pkg-name';
 import getArgs from '../util/get-args';
 import handleError from '../util/handle-error';
-import Client from '../util/client';
+import type Client from '../util/client';
 import { Output } from '../util/output';
-import { Alias, Project } from '../types';
+import { Alias, Deployment, Project } from '@vercel-internals/types';
 import { NowError } from '../util/now-error';
+
+type DeploymentWithAliases = Deployment & {
+  aliases: Alias[];
+};
 
 const help = () => {
   console.log(`
@@ -39,6 +41,7 @@ const help = () => {
     'DIR'
   )}    Path to the global ${'`.vercel`'} directory
     -d, --debug                    Debug mode [off]
+    --no-color                     No color mode [off]
     -t ${chalk.bold.underline('TOKEN')}, --token=${chalk.bold.underline(
     'TOKEN'
   )}        Login token
@@ -114,18 +117,7 @@ export default async function main(client: Client) {
     return 1;
   }
 
-  let contextName: string | null = null;
-
-  try {
-    ({ contextName } = await getScope(client));
-  } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
-  }
+  const { contextName } = await getScope(client);
 
   output.spinner(
     `Fetching deployment(s) ${ids
@@ -135,16 +127,16 @@ export default async function main(client: Client) {
 
   let aliases: Alias[][];
   let projects: Project[];
-  let deployments: DeploymentPartial[];
+  let deployments: DeploymentWithAliases[];
   const findStart = Date.now();
 
   try {
-    const searchFilter = (d: DeploymentPartial) =>
+    const searchFilter = (d: Deployment) =>
       ids.some(
         id =>
           d &&
           !(d instanceof NowError) &&
-          (d.uid === id || d.name === id || d.url === normalizeURL(id))
+          (d.id === id || d.name === id || d.url === normalizeURL(id))
       );
 
     const [deploymentList, projectList] = await Promise.all<any>([
@@ -153,7 +145,7 @@ export default async function main(client: Client) {
           if (!contextName) {
             throw new Error('Context name is not defined');
           }
-          return getDeploymentByIdOrHost(client, contextName, idOrHost);
+          return getDeployment(client, contextName, idOrHost).catch(err => err);
         })
       ),
       Promise.all(
@@ -177,9 +169,15 @@ export default async function main(client: Client) {
         })
       );
 
-      projectDeployments
-        .slice(0, 201)
-        .map(pDeployments => deployments.push(...pDeployments));
+      // only process the first 201 projects
+      const to = Math.min(projectDeployments.length, 201);
+      for (let i = 0; i < to; i++) {
+        for (const pDepl of projectDeployments[i]) {
+          const depl = pDepl as DeploymentWithAliases;
+          depl.aliases = [];
+          deployments.push(depl);
+        }
+      }
 
       projects = [];
     } else {
@@ -191,7 +189,7 @@ export default async function main(client: Client) {
 
     aliases = await Promise.all(
       deployments.map(async depl => {
-        const { aliases } = await getAliases(client, depl.uid);
+        const { aliases } = await getAliases(client, depl.id);
         return aliases;
       })
     );
@@ -237,7 +235,7 @@ export default async function main(client: Client) {
     ).toLowerCase();
 
     if (confirmation !== 'y' && confirmation !== 'yes') {
-      output.log('Aborted');
+      output.log('Canceled');
       return 1;
     }
   }
@@ -249,7 +247,7 @@ export default async function main(client: Client) {
   const start = Date.now();
 
   await Promise.all<any>([
-    ...deployments.map(depl => now.remove(depl.uid, { hard })),
+    ...deployments.map(depl => now.remove(depl.id, { hard })),
     ...projects.map(project => removeProject(client, project.id)),
   ]);
 
@@ -270,7 +268,7 @@ export default async function main(client: Client) {
 }
 
 function readConfirmation(
-  deployments: DeploymentPartial[],
+  deployments: DeploymentWithAliases[],
   projects: Project[],
   output: Output
 ): Promise<string> {
@@ -286,9 +284,9 @@ function readConfirmation(
 
       const deploymentTable = table(
         deployments.map(depl => {
-          const time = chalk.gray(`${ms(Date.now() - depl.created)} ago`);
+          const time = chalk.gray(`${ms(Date.now() - depl.createdAt)} ago`);
           const url = depl.url ? chalk.underline(`https://${depl.url}`) : '';
-          return [`  ${depl.uid}`, url, time];
+          return [`  ${depl.id}`, url, time];
         }),
         { align: ['l', 'r', 'l'], hsep: ' '.repeat(6) }
       );
@@ -335,7 +333,7 @@ function readConfirmation(
 }
 
 function deploymentsAndProjects(
-  deployments: DeploymentPartial[],
+  deployments: DeploymentWithAliases[],
   projects: Project[],
   conjunction = 'and'
 ) {
