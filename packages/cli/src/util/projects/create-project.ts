@@ -1,5 +1,5 @@
 import Client from '../client';
-import { Project } from '../../types';
+import { Project } from '@vercel-internals/types';
 
 export default async function createProject(
   client: Client,
@@ -7,7 +7,7 @@ export default async function createProject(
 ) {
   const project = await client.fetch<Project>('/v1/projects', {
     method: 'POST',
-    body: JSON.stringify({ name: projectName }),
+    body: { name: projectName },
   });
   return project;
 }

@@ -220,26 +220,47 @@ async function runProbe(probe, deploymentId, deploymentUrl, ctx) {
     hadTest = true;
   }
 
+  /**
+   * @type Record<string, string[]>
+   */
+  const rawHeaders = resp.headers.raw();
   if (probe.responseHeaders) {
     // eslint-disable-next-line no-loop-func
     Object.keys(probe.responseHeaders).forEach(header => {
-      const actual = resp.headers.get(header);
-      const expected = probe.responseHeaders[header];
-      const isEqual = Array.isArray(expected)
-        ? expected.every(h => actual.includes(h))
-        : typeof expected === 'string' &&
-          expected.startsWith('/') &&
-          expected.endsWith('/')
-        ? new RegExp(expected.slice(1, -1)).test(actual)
-        : expected === actual;
-      if (!isEqual) {
-        const headers = Array.from(resp.headers.entries())
-          .map(([k, v]) => `  ${k}=${v}`)
-          .join('\n');
+      const actualArr = rawHeaders[header.toLowerCase()];
+      let expectedArr = probe.responseHeaders[header];
 
-        throw new Error(
-          `Page ${probeUrl} does not have header ${header}.\n\nExpected: ${expected}.\nActual: ${headers}`
-        );
+      // Header should not exist
+      if (expectedArr === null) {
+        if (actualArr) {
+          throw new Error(
+            `Page ${probeUrl} contains response header "${header}", but probe says it should not.\n\nActual: ${formatHeaders(
+              rawHeaders
+            )}`
+          );
+        }
+        return;
+      }
+
+      if (!Array.isArray(expectedArr)) {
+        expectedArr = [expectedArr];
+      }
+      for (const expected of expectedArr) {
+        let isEqual = false;
+        for (const actual of actualArr) {
+          isEqual =
+            expected.startsWith('/') && expected.endsWith('/')
+              ? new RegExp(expected.slice(1, -1)).test(actual)
+              : expected === actual;
+          if (isEqual) break;
+        }
+        if (!isEqual) {
+          throw new Error(
+            `Page ${probeUrl} does not have expected response header ${header}.\n\nExpected: ${expected}.\n\nActual: ${formatHeaders(
+              rawHeaders
+            )}`
+          );
+        }
       }
     });
     hadTest = true;
@@ -249,12 +270,10 @@ async function runProbe(probe, deploymentId, deploymentUrl, ctx) {
       const expected = probe.notResponseHeaders[header];
 
       if (headerValue === expected) {
-        const headers = Array.from(resp.headers.entries())
-          .map(([k, v]) => `  ${k}=${v}`)
-          .join('\n');
-
         throw new Error(
-          `Page ${probeUrl} invalid page header ${header}.\n\n Did not expect: ${header}=${expected}.\nBut got ${headers}`
+          `Page ${probeUrl} has unexpected response header ${header}.\n\nDid not expect: ${header}=${expected}.\n\nAll: ${formatHeaders(
+            rawHeaders
+          )}`
         );
       }
     });
@@ -264,12 +283,12 @@ async function runProbe(probe, deploymentId, deploymentUrl, ctx) {
   assert(hadTest, 'probe must have a test condition');
 }
 
-async function testDeployment(
-  { builderUrl, buildUtilsUrl },
-  fixturePath,
-  buildDelegate
-) {
-  logWithinTest('testDeployment', fixturePath);
+async function testDeployment(fixturePath, opts) {
+  const projectName = path
+    .basename(fixturePath)
+    .toLowerCase()
+    .replace(/(_|\.)/g, '-');
+  logWithinTest(`testDeployment "${projectName}"`);
   const globResult = await glob(`${fixturePath}/**`, {
     nodir: true,
     dot: true,
@@ -304,57 +323,41 @@ async function testDeployment(
   const configName = 'vercel.json' in bodies ? 'vercel.json' : 'now.json';
 
   // we use json5 to allow comments for probes
-  const nowJson = json5.parse(bodies[configName]);
+  const nowJson = json5.parse(bodies[configName] || '{}');
   const uploadNowJson = nowJson.uploadNowJson;
   delete nowJson.uploadNowJson;
 
-  ['VERCEL_BUILDER_DEBUG', 'VERCEL_BUILD_CLI_PACKAGE'].forEach(name => {
-    if (process.env[name]) {
-      if (!nowJson.build) {
-        nowJson.build = {};
-      }
-      if (!nowJson.build.env) {
-        nowJson.build.env = {};
-      }
-      nowJson.build.env[name] = process.env[name];
-    }
-  });
-
-  for (const build of nowJson.builds || []) {
-    if (builderUrl) {
-      if (builderUrl === '@canary') {
-        build.use = `${build.use}@canary`;
-      } else {
-        build.use = `https://${builderUrl}`;
-      }
-    }
-    if (buildUtilsUrl) {
-      build.config = build.config || {};
-      const { config } = build;
-      if (buildUtilsUrl === '@canary') {
-        const buildUtils = config.useBuildUtils || '@vercel/build-utils';
-        config.useBuildUtils = `${buildUtils}@canary`;
-      } else {
-        config.useBuildUtils = `https://${buildUtilsUrl}`;
-      }
-    }
-
-    if (buildDelegate) {
-      buildDelegate(build);
-    }
+  const probePath = path.resolve(fixturePath, 'probe.js');
+  let probes = [];
+  if ('probes' in nowJson) {
+    probes = nowJson.probes;
+  } else if ('probes.json' in bodies) {
+    probes = json5.parse(bodies['probes.json']).probes;
+  } else if (fs.existsSync(probePath)) {
+    // we'll run probes after we have the deployment url below
+  } else {
+    console.warn(
+      `WARNING: Test fixture "${fixturePath}" does not contain probes.json, probe.js, or vercel.json`
+    );
   }
-
   bodies[configName] = Buffer.from(JSON.stringify(nowJson));
   delete bodies['probe.js'];
+  delete bodies['probes.json'];
 
   const { deploymentId, deploymentUrl } = await nowDeploy(
+    projectName,
     bodies,
     randomness,
-    uploadNowJson
+    uploadNowJson,
+    opts
   );
   const probeCtx = {};
 
-  for (const probe of nowJson.probes || []) {
+  if (fs.existsSync(probePath)) {
+    await require(probePath)({ deploymentUrl, fetch, randomness });
+  }
+
+  for (const probe of probes) {
     const stringifiedProbe = JSON.stringify(probe);
     logWithinTest('testing', stringifiedProbe);
 
@@ -385,11 +388,6 @@ async function testDeployment(
     }
   }
 
-  const probeJsFullPath = path.resolve(fixturePath, 'probe.js');
-  if (fs.existsSync(probeJsFullPath)) {
-    await require(probeJsFullPath)({ deploymentUrl, fetch, randomness });
-  }
-
   return { deploymentId, deploymentUrl };
 }
 
@@ -399,14 +397,14 @@ async function nowDeployIndexTgz(file) {
     'now.json': Buffer.from(JSON.stringify({ version: 2 })),
   };
 
-  return (await nowDeploy(bodies)).deploymentUrl;
+  return (await nowDeploy('pack-n-deploy', bodies)).deploymentUrl;
 }
 
 async function fetchDeploymentUrl(url, opts) {
   for (let i = 0; i < 50; i += 1) {
     const resp = await fetch(url, opts);
     const text = await resp.text();
-    if (text && !text.includes('Join Free')) {
+    if (typeof text !== 'undefined' && !text.includes('Join Free')) {
       return { resp, text };
     }
 
@@ -454,6 +452,15 @@ async function spawnAsync(...args) {
       resolve(result);
     });
   });
+}
+
+/**
+ * @param {Record<string, string[]>} headers
+ */
+function formatHeaders(headers) {
+  return Object.entries(headers)
+    .flatMap(([name, values]) => values.map(v => `  ${name}: ${v}`))
+    .join('\n');
 }
 
 module.exports = {

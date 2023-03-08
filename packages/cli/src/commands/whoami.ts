@@ -19,6 +19,7 @@ const help = () => {
     'DIR'
   )}    Path to the global ${'`.vercel`'} directory
     -d, --debug                    Debug mode [off]
+    --no-color                     No color mode [off]
     -t ${chalk.bold.underline('TOKEN')}, --token=${chalk.bold.underline(
     'TOKEN'
   )}        Login token
@@ -41,18 +42,7 @@ export default async (client: Client): Promise<number> => {
     return 2;
   }
 
-  let contextName = null;
-
-  try {
-    ({ contextName } = await getScope(client, { getTeam: false }));
-  } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
-  }
+  const { contextName } = await getScope(client, { getTeam: false });
 
   if (client.stdout.isTTY) {
     output.log(contextName);

@@ -4,7 +4,7 @@ import {
   ProjectEnvTarget,
   ProjectEnvVariable,
   ProjectEnvType,
-} from '../../types';
+} from '@vercel-internals/types';
 
 export default async function addEnvRecord(
   output: Output,
@@ -29,6 +29,6 @@ export default async function addEnvRecord(
   const url = `/v8/projects/${projectId}/env`;
   await client.fetch(url, {
     method: 'POST',
-    body: JSON.stringify(body),
+    body,
   });
 }

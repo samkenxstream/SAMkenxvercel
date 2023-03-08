@@ -1,7 +1,7 @@
 import { join, basename } from 'path';
 import chalk from 'chalk';
 import { remove } from 'fs-extra';
-import { ProjectLinkResult, ProjectSettings } from '../../types';
+import { ProjectLinkResult, ProjectSettings } from '@vercel-internals/types';
 import {
   getLinkedProject,
   linkFolderToProject,
@@ -27,12 +27,14 @@ import stamp from '../output/stamp';
 import { EmojiLabel } from '../emoji';
 import createDeploy from '../deploy/create-deploy';
 import Now, { CreateOptions } from '../index';
+import { isAPIError } from '../errors-ts';
 
 export interface SetupAndLinkOptions {
-  forceDelete?: boolean;
   autoConfirm?: boolean;
-  successEmoji: EmojiLabel;
-  setupMsg: string;
+  forceDelete?: boolean;
+  link?: ProjectLinkResult;
+  successEmoji?: EmojiLabel;
+  setupMsg?: string;
   projectName?: string;
 }
 
@@ -40,10 +42,11 @@ export default async function setupAndLink(
   client: Client,
   path: string,
   {
-    forceDelete = false,
     autoConfirm = false,
-    successEmoji,
-    setupMsg,
+    forceDelete = false,
+    link,
+    successEmoji = 'link',
+    setupMsg = 'Set up',
     projectName,
   }: SetupAndLinkOptions
 ): Promise<ProjectLinkResult> {
@@ -55,7 +58,9 @@ export default async function setupAndLink(
     output.error(`Expected directory but found file: ${path}`);
     return { status: 'error', exitCode: 1, reason: 'PATH_IS_FILE' };
   }
-  const link = await getLinkedProject(client, path);
+  if (!link) {
+    link = await getLinkedProject(client, path);
+  }
   const isTTY = client.stdin.isTTY;
   const quiet = !isTTY;
   let rootDirectory: string | null = null;
@@ -86,7 +91,7 @@ export default async function setupAndLink(
     ));
 
   if (!shouldStartSetup) {
-    output.print(`Aborted. Project not set up.\n`);
+    output.print(`Canceled. Project not set up.\n`);
     return { status: 'not_linked', org: null, project: null };
   }
 
@@ -96,15 +101,17 @@ export default async function setupAndLink(
       'Which scope should contain your project?',
       autoConfirm
     );
-  } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED') {
-      output.prettyError(err);
-      return { status: 'error', exitCode: 1, reason: 'NOT_AUTHORIZED' };
-    }
+  } catch (err: unknown) {
+    if (isAPIError(err)) {
+      if (err.code === 'NOT_AUTHORIZED') {
+        output.prettyError(err);
+        return { status: 'error', exitCode: 1, reason: 'NOT_AUTHORIZED' };
+      }
 
-    if (err.code === 'TEAM_DELETED') {
-      output.prettyError(err);
-      return { status: 'error', exitCode: 1, reason: 'TEAM_DELETED' };
+      if (err.code === 'TEAM_DELETED') {
+        output.prettyError(err);
+        return { status: 'error', exitCode: 1, reason: 'TEAM_DELETED' };
+      }
     }
 
     throw err;
@@ -238,6 +245,7 @@ export default async function setupAndLink(
     }
 
     const project = await createProject(client, newProjectName);
+
     await updateProject(client, project.id, settings);
     Object.assign(project, settings);
 

@@ -41,6 +41,7 @@ export interface Config {
   devCommand?: string;
   framework?: string | null;
   nodeVersion?: string;
+  middleware?: boolean;
   [key: string]: unknown;
 }
 
@@ -341,6 +342,7 @@ export interface BuilderV2 {
   version: 2;
   build: BuildV2;
   prepareCache?: PrepareCache;
+  shouldServe?: ShouldServe;
 }
 
 export interface BuilderV3 {
@@ -352,6 +354,8 @@ export interface BuilderV3 {
 }
 
 type ImageFormat = 'image/avif' | 'image/webp';
+
+type ImageContentDispositionType = 'inline' | 'attachment';
 
 export type RemotePattern = {
   /**
@@ -388,6 +392,7 @@ export interface Images {
   formats?: ImageFormat[];
   dangerouslyAllowSVG?: boolean;
   contentSecurityPolicy?: string;
+  contentDispositionType?: ImageContentDispositionType;
 }
 
 /**
@@ -408,6 +413,17 @@ export interface BuildResultBuildOutput {
   buildOutputPath: string;
 }
 
+export interface Cron {
+  path: string;
+  schedule: string;
+}
+
+/** The framework which created the function */
+export interface FunctionFramework {
+  slug: string;
+  version?: string;
+}
+
 /**
  * When a Builder implements `version: 2`, the `build()` function is expected
  * to return this type.
@@ -423,6 +439,9 @@ export interface BuildResultV2Typical {
     domain: string;
     value: string;
   }>;
+  framework?: {
+    version: string;
+  };
 }
 
 export type BuildResultV2 = BuildResultV2Typical | BuildResultBuildOutput;

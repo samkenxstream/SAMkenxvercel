@@ -2,7 +2,7 @@ import chalk from 'chalk';
 import plural from 'pluralize';
 
 import { DomainNotFound, DomainPermissionDenied } from '../../util/errors-ts';
-import { Domain } from '../../types';
+import { Domain } from '@vercel-internals/types';
 import { Output } from '../../util/output';
 import Client from '../../util/client';
 import deleteCertById from '../../util/certs/delete-cert-by-id';
@@ -29,18 +29,7 @@ export default async function rm(
 ) {
   const { output } = client;
   const [domainName] = args;
-  let contextName = null;
-
-  try {
-    ({ contextName } = await getScope(client));
-  } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
-  }
+  const { contextName } = await getScope(client);
 
   if (!domainName) {
     output.error(
@@ -97,7 +86,7 @@ export default async function rm(
       client
     ))
   ) {
-    output.log('Aborted');
+    output.log('Canceled');
     return 0;
   }
 
@@ -122,10 +111,10 @@ async function removeDomain(
     output.debug(`Removing alias ${id}`);
     try {
       await removeAliasById(client, id);
-    } catch (error) {
+    } catch (err: unknown) {
       // Ignore if the alias does not exist anymore
-      if (error.status !== 404) {
-        throw error;
+      if (!ERRORS.isAPIError(err) || err.status !== 404) {
+        throw err;
       }
     }
   }
@@ -134,10 +123,10 @@ async function removeDomain(
     output.debug(`Removing cert ${id}`);
     try {
       await deleteCertById(output, client, id);
-    } catch (error) {
+    } catch (err: unknown) {
       // Ignore if the cert does not exist anymore
-      if (error.status !== 404) {
-        throw error;
+      if (!ERRORS.isAPIError(err) || err.status !== 404) {
+        throw err;
       }
     }
   }
@@ -235,7 +224,7 @@ async function removeDomain(
       !skipConfirmation &&
       !(await promptBool(`Remove conflicts associated with domain?`, client))
     ) {
-      output.log('Aborted');
+      output.log('Canceled');
       return 0;
     }
 
