@@ -9,9 +9,11 @@ import { handleError } from '../util/error';
 import getScope from '../util/get-scope';
 import { getPkgName, getCommandName } from '../util/pkg-name';
 import Client from '../util/client';
-import { getDeployment } from '../util/get-deployment';
-import { Deployment } from '@vercel/client';
-import { Build } from '../types';
+import getDeployment from '../util/get-deployment';
+import { Build, Deployment } from '@vercel-internals/types';
+import title from 'title';
+import { isErrnoException } from '@vercel/error-utils';
+import { URL } from 'url';
 
 const help = () => {
   console.log(`
@@ -30,6 +32,7 @@ const help = () => {
     'TOKEN'
   )}        Login token
     -d, --debug                    Debug mode [off]
+    --no-color                     No color mode [off]
     -S, --scope                    Set a custom scope
 
   ${chalk.dim('Examples:')}
@@ -45,7 +48,6 @@ const help = () => {
 };
 
 export default async function main(client: Client) {
-  let deployment;
   let argv;
 
   try {
@@ -63,7 +65,7 @@ export default async function main(client: Client) {
   const { print, log, error } = client.output;
 
   // extract the first parameter
-  const [, deploymentIdOrHost] = argv._;
+  let [, deploymentIdOrHost] = argv._;
 
   if (argv._.length !== 2) {
     error(`${getCommandName('inspect <url>')} expects exactly one argument`);
@@ -75,8 +77,11 @@ export default async function main(client: Client) {
 
   try {
     ({ contextName } = await getScope(client));
-  } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
+  } catch (err: unknown) {
+    if (
+      isErrnoException(err) &&
+      (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED')
+    ) {
       error(err.message);
       return 1;
     }
@@ -84,63 +89,68 @@ export default async function main(client: Client) {
     throw err;
   }
 
-  // resolve the deployment, since we might have been given an alias
   const depFetchStart = Date.now();
+
+  try {
+    deploymentIdOrHost = new URL(deploymentIdOrHost).hostname;
+  } catch {}
   client.output.spinner(
     `Fetching deployment "${deploymentIdOrHost}" in ${chalk.bold(contextName)}`
   );
 
-  try {
-    deployment = await getDeployment(client, deploymentIdOrHost);
-  } catch (err) {
-    if (err.status === 404) {
-      error(
-        `Failed to find deployment "${deploymentIdOrHost}" in ${chalk.bold(
-          contextName
-        )}`
-      );
-      return 1;
-    }
-    if (err.status === 403) {
-      error(
-        `No permission to access deployment "${deploymentIdOrHost}" in ${chalk.bold(
-          contextName
-        )}`
-      );
-      return 1;
-    }
-    // unexpected
-    throw err;
-  }
+  // resolve the deployment, since we might have been given an alias
+  const deployment = await getDeployment(
+    client,
+    contextName,
+    deploymentIdOrHost
+  );
 
-  const { id, name, url, createdAt, routes, readyState } = deployment;
+  const {
+    id,
+    name,
+    url,
+    createdAt,
+    routes,
+    readyState,
+    alias: aliases,
+  } = deployment;
 
   const { builds } =
     deployment.version === 2
-      ? await client.fetch<{ builds: Build[] }>(`/v1/deployments/${id}/builds`)
+      ? await client.fetch<{ builds: Build[] }>(`/v11/deployments/${id}/builds`)
       : { builds: [] };
 
   log(
-    `Fetched deployment "${url}" in ${chalk.bold(contextName)} ${elapsed(
-      Date.now() - depFetchStart
-    )}`
+    `Fetched deployment "${chalk.bold(url)}" in ${chalk.bold(
+      contextName
+    )} ${elapsed(Date.now() - depFetchStart)}`
   );
 
   print('\n');
   print(chalk.bold('  General\n\n'));
   print(`    ${chalk.cyan('id')}\t\t${id}\n`);
   print(`    ${chalk.cyan('name')}\t${name}\n`);
-  print(`    ${chalk.cyan('readyState')}\t${stateString(readyState)}\n`);
-  print(`    ${chalk.cyan('url')}\t\t${url}\n`);
+  print(`    ${chalk.cyan('status')}\t${stateString(readyState)}\n`);
+  print(`    ${chalk.cyan('url')}\t\thttps://${url}\n`);
   if (createdAt) {
     print(
-      `    ${chalk.cyan('createdAt')}\t${new Date(createdAt)} ${elapsed(
+      `    ${chalk.cyan('created')}\t${new Date(createdAt)} ${elapsed(
         Date.now() - createdAt,
         true
       )}\n`
     );
   }
   print('\n\n');
+
+  if (aliases !== undefined && aliases.length > 0) {
+    print(chalk.bold('  Aliases\n\n'));
+    let aliasList = '';
+    for (const alias of aliases) {
+      aliasList += `${chalk.gray('╶')} https://${alias}\n`;
+    }
+    print(indent(aliasList, 4));
+    print('\n\n');
+  }
 
   if (builds.length > 0) {
     const times: { [id: string]: string | null } = {};
@@ -165,19 +175,22 @@ export default async function main(client: Client) {
   return 0;
 }
 
-// renders the state string
 function stateString(s: Deployment['readyState']) {
+  const CIRCLE = '● ';
+  const sTitle = s && title(s);
   switch (s) {
     case 'INITIALIZING':
-      return chalk.yellow(s);
-
+    case 'BUILDING':
+      return chalk.yellow(CIRCLE) + sTitle;
     case 'ERROR':
-      return chalk.red(s);
-
+      return chalk.red(CIRCLE) + sTitle;
     case 'READY':
-      return s;
-
+      return chalk.green(CIRCLE) + sTitle;
+    case 'QUEUED':
+      return chalk.gray(CIRCLE) + sTitle;
+    case 'CANCELED':
+      return chalk.gray(CIRCLE) + sTitle;
     default:
-      return chalk.gray(s || 'UNKNOWN');
+      return chalk.gray('UNKNOWN');
   }
 }

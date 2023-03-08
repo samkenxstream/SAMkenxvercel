@@ -3,6 +3,7 @@ import chalk from 'chalk';
 import dotenv from 'dotenv';
 import { join, normalize, relative, resolve } from 'path';
 import {
+  getDiscontinuedNodeVersions,
   normalizePath,
   Files,
   FileFsRef,
@@ -15,8 +16,13 @@ import {
   BuildResultV2Typical,
   BuildResultV3,
   NowBuildError,
+  Cron,
 } from '@vercel/build-utils';
-import { detectBuilders } from '@vercel/fs-detectors';
+import {
+  detectBuilders,
+  detectFrameworkRecord,
+  LocalFileSystemDetector,
+} from '@vercel/fs-detectors';
 import minimatch from 'minimatch';
 import {
   appendRoutesToPhase,
@@ -25,7 +31,8 @@ import {
   MergeRoutesProps,
   Route,
 } from '@vercel/routing-utils';
-import { VercelConfig } from '@vercel/client';
+import { fileNameSymbol } from '@vercel/client';
+import type { VercelConfig } from '@vercel/client';
 
 import pull from './pull';
 import { staticFiles as getFiles } from '../util/get-files';
@@ -36,7 +43,11 @@ import * as cli from '../util/pkg-name';
 import cliPkg from '../util/pkg';
 import readJSONFile from '../util/read-json-file';
 import { CantParseJSONFile } from '../util/errors-ts';
-import { readProjectSettings } from '../util/projects/project-settings';
+import {
+  pickOverrides,
+  ProjectLinkAndSettings,
+  readProjectSettings,
+} from '../util/projects/project-settings';
 import { VERCEL_DIR } from '../util/projects/link';
 import confirm from '../util/input/confirm';
 import { emoji, prependEmoji } from '../util/emoji';
@@ -46,10 +57,51 @@ import {
   PathOverride,
   writeBuildResult,
 } from '../util/build/write-build-result';
-import { importBuilders, BuilderWithPkg } from '../util/build/import-builders';
+import { importBuilders } from '../util/build/import-builders';
 import { initCorepack, cleanupCorepack } from '../util/build/corepack';
+import { sortBuilders } from '../util/build/sort-builders';
+import { toEnumerableError } from '../util/error';
+import { validateConfig } from '../util/validate-config';
+
+import { setMonorepoDefaultSettings } from '../util/build/monorepo';
+import frameworks from '@vercel/frameworks';
+import { detectFrameworkVersion } from '@vercel/fs-detectors';
+import semver from 'semver';
 
 type BuildResult = BuildResultV2 | BuildResultV3;
+
+interface SerializedBuilder extends Builder {
+  error?: any;
+  require?: string;
+  requirePath?: string;
+  apiVersion: number;
+}
+
+/**
+ *  Build Output API `config.json` file interface.
+ */
+interface BuildOutputConfig {
+  version?: 3;
+  wildcard?: BuildResultV2Typical['wildcard'];
+  images?: BuildResultV2Typical['images'];
+  routes?: BuildResultV2Typical['routes'];
+  overrides?: Record<string, PathOverride>;
+  framework?: {
+    version: string;
+  };
+  crons?: Cron[];
+}
+
+/**
+ * Contents of the `builds.json` file.
+ */
+export interface BuildsManifest {
+  '//': string;
+  target: string;
+  argv: string[];
+  error?: any;
+  builds?: SerializedBuilder[];
+}
 
 const help = () => {
   return console.log(`
@@ -68,11 +120,12 @@ const help = () => {
       --output [path]                Directory where built assets should be written to
       --prod                         Build a production deployment
       -d, --debug                    Debug mode [off]
-      -y, --yes                      Skip the confirmation prompt
+      --no-color                     No color mode [off]
+      -y, --yes                      Skip the confirmation prompt about pulling environment variables and project settings when not found locally
 
     ${chalk.dim('Examples:')}
 
-    ${chalk.gray('–')} Build the project
+    ${chalk.gray('-')} Build the project
 
       ${chalk.cyan(`$ ${cli.name} build`)}
       ${chalk.cyan(`$ ${cli.name} build --cwd ./path-to-project`)}
@@ -101,7 +154,6 @@ export default async function main(client: Client): Promise<number> {
 
   // Parse CLI args
   const argv = getArgs(client.argv.slice(2), {
-    '--cwd': String,
     '--output': String,
     '--prod': Boolean,
     '--yes': Boolean,
@@ -112,10 +164,6 @@ export default async function main(client: Client): Promise<number> {
     return 2;
   }
 
-  // Set the working directory if necessary
-  if (argv['--cwd']) {
-    process.chdir(argv['--cwd']);
-  }
   const cwd = process.cwd();
 
   // Build `target` influences which environment variables will be used
@@ -134,7 +182,7 @@ export default async function main(client: Client): Promise<number> {
         client.output.print(
           `No Project Settings found locally. Run ${cli.getCommandName(
             'pull --yes'
-          )} to retreive them.`
+          )} to retrieve them.`
         );
         return 1;
       }
@@ -148,7 +196,7 @@ export default async function main(client: Client): Promise<number> {
       );
     }
     if (!confirmed) {
-      client.output.print(`Aborted. No Project Settings retrieved.\n`);
+      client.output.print(`Canceled. No Project Settings retrieved.\n`);
       return 0;
     }
     const { argv: originalArgv } = client;
@@ -166,55 +214,151 @@ export default async function main(client: Client): Promise<number> {
     project = await readProjectSettings(join(cwd, VERCEL_DIR));
   }
 
-  // TODO: load env vars from the API, fall back to local files if that fails
-
-  const envPath = await checkExists([
-    join(cwd, VERCEL_DIR, `.env.${target}.local`),
-    join(cwd, `.env`),
+  // Delete output directory from potential previous build
+  const defaultOutputDir = join(cwd, OUTPUT_DIR);
+  const outputDir = argv['--output']
+    ? resolve(argv['--output'])
+    : defaultOutputDir;
+  await Promise.all([
+    fs.remove(outputDir),
+    // Also delete `.vercel/output`, in case the script is targeting Build Output API directly
+    outputDir !== defaultOutputDir ? fs.remove(defaultOutputDir) : undefined,
   ]);
-  if (envPath) {
-    dotenv.config({ path: envPath, debug: client.output.isDebugEnabled() });
-    output.log(`Loaded env from "${relative(cwd, envPath)}"`);
-  }
 
-  // Some build processes use these env vars to platform detect Vercel
-  process.env.VERCEL = '1';
-  process.env.NOW_BUILDER = '1';
+  const buildsJson: BuildsManifest = {
+    '//': 'This file was generated by the `vercel build` command. It is not part of the Build Output API.',
+    target,
+    argv: process.argv,
+  };
+
+  const envToUnset = new Set<string>(['VERCEL', 'NOW_BUILDER']);
+
+  try {
+    const envPath = join(cwd, VERCEL_DIR, `.env.${target}.local`);
+    // TODO (maybe?): load env vars from the API, fall back to the local file if that fails
+    const dotenvResult = dotenv.config({
+      path: envPath,
+      debug: client.output.isDebugEnabled(),
+    });
+    if (dotenvResult.error) {
+      output.debug(
+        `Failed loading environment variables: ${dotenvResult.error}`
+      );
+    } else if (dotenvResult.parsed) {
+      for (const key of Object.keys(dotenvResult.parsed)) {
+        envToUnset.add(key);
+      }
+      output.debug(`Loaded environment variables from "${envPath}"`);
+    }
+
+    // For Vercel Analytics support
+    if (project.settings.analyticsId) {
+      envToUnset.add('VERCEL_ANALYTICS_ID');
+      process.env.VERCEL_ANALYTICS_ID = project.settings.analyticsId;
+    }
+
+    // Some build processes use these env vars to platform detect Vercel
+    process.env.VERCEL = '1';
+    process.env.NOW_BUILDER = '1';
+
+    await doBuild(client, project, buildsJson, cwd, outputDir);
+    return 0;
+  } catch (err: any) {
+    output.prettyError(err);
+
+    // Write error to `builds.json` file
+    buildsJson.error = toEnumerableError(err);
+    const buildsJsonPath = join(outputDir, 'builds.json');
+    const configJsonPath = join(outputDir, 'config.json');
+    await fs.outputJSON(buildsJsonPath, buildsJson, {
+      spaces: 2,
+    });
+    await fs.writeJSON(configJsonPath, { version: 3 }, { spaces: 2 });
+
+    return 1;
+  } finally {
+    // Unset environment variables that were added by dotenv
+    // (this is mostly for the unit tests)
+    for (const key of envToUnset) {
+      delete process.env[key];
+    }
+  }
+}
+
+/**
+ * Execute the Project's builders. If this function throws an error,
+ * then it will be serialized into the `builds.json` manifest file.
+ */
+async function doBuild(
+  client: Client,
+  project: ProjectLinkAndSettings,
+  buildsJson: BuildsManifest,
+  cwd: string,
+  outputDir: string
+): Promise<void> {
+  const { output } = client;
 
   const workPath = join(cwd, project.settings.rootDirectory || '.');
 
-  // Load `package.json` and `vercel.json` files
-  const [pkg, vercelConfig] = await Promise.all([
+  const [pkg, vercelConfig, nowConfig] = await Promise.all([
     readJSONFile<PackageJson>(join(workPath, 'package.json')),
-    readJSONFile<VercelConfig>(join(workPath, 'vercel.json')).then(
-      config => config || readJSONFile<VercelConfig>(join(workPath, 'now.json'))
-    ),
+    readJSONFile<VercelConfig>(join(workPath, 'vercel.json')),
+    readJSONFile<VercelConfig>(join(workPath, 'now.json')),
   ]);
+
   if (pkg instanceof CantParseJSONFile) throw pkg;
   if (vercelConfig instanceof CantParseJSONFile) throw vercelConfig;
+  if (nowConfig instanceof CantParseJSONFile) throw nowConfig;
+
+  if (vercelConfig) {
+    vercelConfig[fileNameSymbol] = 'vercel.json';
+  } else if (nowConfig) {
+    nowConfig[fileNameSymbol] = 'now.json';
+  }
+
+  const localConfig = vercelConfig || nowConfig || {};
+  const validateError = validateConfig(localConfig);
+
+  if (validateError) {
+    throw validateError;
+  }
+
+  const projectSettings = {
+    ...project.settings,
+    ...pickOverrides(localConfig),
+  };
+
+  if (
+    process.env.VERCEL_BUILD_MONOREPO_SUPPORT === '1' &&
+    pkg?.scripts?.['vercel-build'] === undefined &&
+    projectSettings.rootDirectory !== null &&
+    projectSettings.rootDirectory !== '.'
+  ) {
+    await setMonorepoDefaultSettings(cwd, workPath, projectSettings, output);
+  }
 
   // Get a list of source files
   const files = (await getFiles(workPath, client)).map(f =>
     normalizePath(relative(workPath, f))
   );
 
-  const routesResult = getTransformedRoutes({ nowConfig: vercelConfig || {} });
+  const routesResult = getTransformedRoutes(localConfig);
   if (routesResult.error) {
-    output.prettyError(routesResult.error);
-    return 1;
+    throw routesResult.error;
   }
 
-  if (vercelConfig?.builds && vercelConfig.functions) {
-    output.prettyError({
+  if (localConfig.builds && localConfig.functions) {
+    throw new NowBuildError({
+      code: 'bad_request',
       message:
         'The `functions` property cannot be used in conjunction with the `builds` property. Please remove one of them.',
       link: 'https://vercel.link/functions-and-builds',
     });
-    return 1;
   }
 
-  let builds = vercelConfig?.builds || [];
+  let builds = localConfig.builds || [];
   let zeroConfigRoutes: Route[] = [];
+  let isZeroConfig = false;
 
   if (builds.length > 0) {
     output.warn(
@@ -223,17 +367,18 @@ export default async function main(client: Client): Promise<number> {
     builds = builds.map(b => expandBuild(files, b)).flat();
   } else {
     // Zero config
+    isZeroConfig = true;
 
     // Detect the Vercel Builders that will need to be invoked
     const detectedBuilders = await detectBuilders(files, pkg, {
-      ...vercelConfig,
-      projectSettings: project.settings,
+      ...localConfig,
+      projectSettings,
+      ignoreBuildScript: true,
       featHandleMiss: true,
     });
 
     if (detectedBuilders.errors && detectedBuilders.errors.length > 0) {
-      output.prettyError(detectedBuilders.errors[0]);
-      return 1;
+      throw detectedBuilders.errors[0];
     }
 
     for (const w of detectedBuilders.warnings) {
@@ -266,13 +411,7 @@ export default async function main(client: Client): Promise<number> {
 
   const builderSpecs = new Set(builds.map(b => b.use));
 
-  let buildersWithPkgs: Map<string, BuilderWithPkg>;
-  try {
-    buildersWithPkgs = await importBuilders(builderSpecs, cwd, output);
-  } catch (err: any) {
-    output.prettyError(err);
-    return 1;
-  }
+  const buildersWithPkgs = await importBuilders(builderSpecs, cwd, output);
 
   // Populate Files -> FileFsRef mapping
   const filesMap: Files = {};
@@ -282,12 +421,6 @@ export default async function main(client: Client): Promise<number> {
     filesMap[path] = new FileFsRef({ mode, fsPath });
   }
 
-  // Delete output directory from potential previous build
-  const outputDir = argv['--output']
-    ? resolve(argv['--output'])
-    : join(cwd, OUTPUT_DIR);
-  await fs.remove(outputDir);
-
   const buildStamp = stamp();
 
   // Create fresh new output directory
@@ -296,32 +429,28 @@ export default async function main(client: Client): Promise<number> {
   const ops: Promise<Error | void>[] = [];
 
   // Write the `detectedBuilders` result to output dir
-  ops.push(
-    fs.writeJSON(
-      join(outputDir, 'builds.json'),
-      {
-        '//': 'This file was generated by the `vercel build` command. It is not part of the Build Output API.',
-        target,
-        argv: process.argv,
-        builds: builds.map(build => {
-          const builderWithPkg = buildersWithPkgs.get(build.use);
-          if (!builderWithPkg) {
-            throw new Error(`Failed to load Builder "${build.use}"`);
-          }
-          const { builder, pkg: builderPkg } = builderWithPkg;
-          return {
-            require: builderPkg.name,
-            requirePath: builderWithPkg.path,
-            apiVersion: builder.version,
-            ...build,
-          };
-        }),
-      },
-      {
-        spaces: 2,
+  const buildsJsonBuilds = new Map<Builder, SerializedBuilder>(
+    builds.map(build => {
+      const builderWithPkg = buildersWithPkgs.get(build.use);
+      if (!builderWithPkg) {
+        throw new Error(`Failed to load Builder "${build.use}"`);
       }
-    )
+      const { builder, pkg: builderPkg } = builderWithPkg;
+      return [
+        build,
+        {
+          require: builderPkg.name,
+          requirePath: builderWithPkg.path,
+          apiVersion: builder.version,
+          ...build,
+        },
+      ];
+    })
   );
+  buildsJson.builds = Array.from(buildsJsonBuilds.values());
+  await fs.writeJSON(join(outputDir, 'builds.json'), buildsJson, {
+    spaces: 2,
+  });
 
   // The `meta` config property is re-used for each Builder
   // invocation so that Builders can share state between
@@ -332,65 +461,111 @@ export default async function main(client: Client): Promise<number> {
   };
 
   // Execute Builders for detected entrypoints
-  // TODO: parallelize builds
-  const buildResults: Map<Builder, BuildResult> = new Map();
+  // TODO: parallelize builds (except for frontend)
+  const sortedBuilders = sortBuilders(builds);
+  const buildResults: Map<Builder, BuildResult | BuildOutputConfig> = new Map();
   const overrides: PathOverride[] = [];
   const repoRootPath = cwd;
-  const rootPackageJsonPath = repoRootPath || workPath;
-  const corepackShimDir = await initCorepack({ cwd, rootPackageJsonPath });
+  const corepackShimDir = await initCorepack({ repoRootPath });
 
-  for (const build of builds) {
+  for (const build of sortedBuilders) {
     if (typeof build.src !== 'string') continue;
 
     const builderWithPkg = buildersWithPkgs.get(build.use);
     if (!builderWithPkg) {
       throw new Error(`Failed to load Builder "${build.use}"`);
     }
-    const { builder, pkg: builderPkg } = builderWithPkg;
 
-    const buildConfig: Config = {
-      outputDirectory: project.settings.outputDirectory ?? undefined,
-      ...build.config,
-      projectSettings: project.settings,
-      installCommand: project.settings.installCommand ?? undefined,
-      devCommand: project.settings.devCommand ?? undefined,
-      buildCommand: project.settings.buildCommand ?? undefined,
-      framework: project.settings.framework,
-      nodeVersion: project.settings.nodeVersion,
-    };
-    const buildOptions: BuildOptions = {
-      files: filesMap,
-      entrypoint: build.src,
-      workPath,
-      repoRootPath,
-      config: buildConfig,
-      meta,
-    };
-    output.debug(
-      `Building entrypoint "${build.src}" with "${builderPkg.name}"`
-    );
-    const buildResult = await builder.build(buildOptions);
+    try {
+      const { builder, pkg: builderPkg } = builderWithPkg;
 
-    // Store the build result to generate the final `config.json` after
-    // all builds have completed
-    buildResults.set(build, buildResult);
+      for (const key of [
+        'buildCommand',
+        'installCommand',
+        'outputDirectory',
+        'nodeVersion',
+      ] as const) {
+        const value = projectSettings[key];
+        if (typeof value === 'string') {
+          const envKey =
+            `VERCEL_PROJECT_SETTINGS_` +
+            key.replace(/[A-Z]/g, letter => `_${letter}`).toUpperCase();
+          process.env[envKey] = value;
+          output.debug(`Setting env ${envKey} to "${value}"`);
+        }
+      }
 
-    // Start flushing the file outputs to the filesystem asynchronously
-    ops.push(
-      writeBuildResult(
-        outputDir,
-        buildResult,
-        build,
-        builder,
-        builderPkg,
-        vercelConfig?.cleanUrls
-      ).then(
-        override => {
-          if (override) overrides.push(override);
-        },
-        err => err
-      )
-    );
+      const buildConfig: Config = isZeroConfig
+        ? {
+            outputDirectory: projectSettings.outputDirectory ?? undefined,
+            ...build.config,
+            projectSettings,
+            installCommand: projectSettings.installCommand ?? undefined,
+            devCommand: projectSettings.devCommand ?? undefined,
+            buildCommand: projectSettings.buildCommand ?? undefined,
+            framework: projectSettings.framework,
+            nodeVersion: projectSettings.nodeVersion,
+          }
+        : build.config || {};
+      const buildOptions: BuildOptions = {
+        files: filesMap,
+        entrypoint: build.src,
+        workPath,
+        repoRootPath,
+        config: buildConfig,
+        meta,
+      };
+      output.debug(
+        `Building entrypoint "${build.src}" with "${builderPkg.name}"`
+      );
+      const buildResult = await builder.build(buildOptions);
+
+      if (
+        buildResult &&
+        'output' in buildResult &&
+        'runtime' in buildResult.output &&
+        'type' in buildResult.output &&
+        buildResult.output.type === 'Lambda'
+      ) {
+        const lambdaRuntime = buildResult.output.runtime;
+        if (
+          getDiscontinuedNodeVersions().some(o => o.runtime === lambdaRuntime)
+        ) {
+          throw new NowBuildError({
+            code: 'NODEJS_DISCONTINUED_VERSION',
+            message: `The Runtime "${build.use}" is using "${lambdaRuntime}", which is discontinued. Please upgrade your Runtime to a more recent version or consult the author for more details.`,
+            link: 'https://github.com/vercel/vercel/blob/main/DEVELOPING_A_RUNTIME.md#lambdaruntime',
+          });
+        }
+      }
+
+      // Store the build result to generate the final `config.json` after
+      // all builds have completed
+      buildResults.set(build, buildResult);
+
+      // Start flushing the file outputs to the filesystem asynchronously
+      ops.push(
+        writeBuildResult(
+          outputDir,
+          buildResult,
+          build,
+          builder,
+          builderPkg,
+          localConfig
+        ).then(
+          override => {
+            if (override) overrides.push(override);
+          },
+          err => err
+        )
+      );
+    } catch (err: any) {
+      const buildJsonBuild = buildsJsonBuilds.get(build);
+      if (buildJsonBuild) {
+        buildJsonBuild.error = toEnumerableError(err);
+      }
+      throw err;
+    }
   }
 
   if (corepackShimDir) {
@@ -399,20 +574,16 @@ export default async function main(client: Client): Promise<number> {
 
   // Wait for filesystem operations to complete
   // TODO render progress bar?
-  let hadError = false;
   const errors = await Promise.all(ops);
   for (const error of errors) {
     if (error) {
-      hadError = true;
-      output.prettyError(error);
+      throw error;
     }
   }
-  if (hadError) return 1;
 
   // Merge existing `config.json` file into the one that will be produced
   const configPath = join(outputDir, 'config.json');
-  // TODO: properly type
-  const existingConfig = await readJSONFile<any>(configPath);
+  const existingConfig = await readJSONFile<BuildOutputConfig>(configPath);
   if (existingConfig instanceof CantParseJSONFile) {
     throw existingConfig;
   }
@@ -453,20 +624,24 @@ export default async function main(client: Client): Promise<number> {
     builds: builderRoutes,
   });
 
-  const mergedImages = mergeImages(buildResults.values());
+  const mergedImages = mergeImages(localConfig.images, buildResults.values());
+  const mergedCrons = mergeCrons(localConfig.crons, buildResults.values());
   const mergedWildcard = mergeWildcard(buildResults.values());
   const mergedOverrides: Record<string, PathOverride> =
     overrides.length > 0 ? Object.assign({}, ...overrides) : undefined;
 
+  const framework = await getFramework(cwd, buildResults);
+
   // Write out the final `config.json` file based on the
   // user configuration and Builder build results
-  // TODO: properly type
-  const config = {
+  const config: BuildOutputConfig = {
     version: 3,
     routes: mergedRoutes,
     images: mergedImages,
     wildcard: mergedWildcard,
     overrides: mergedOverrides,
+    framework,
+    crons: mergedCrons,
   };
   await fs.writeJSON(join(outputDir, 'config.json'), config, { spaces: 2 });
 
@@ -479,8 +654,50 @@ export default async function main(client: Client): Promise<number> {
       emoji('success')
     )}\n`
   );
+}
 
-  return 0;
+async function getFramework(
+  cwd: string,
+  buildResults: Map<Builder, BuildResult | BuildOutputConfig>
+): Promise<{ version: string } | undefined> {
+  const detectedFramework = await detectFrameworkRecord({
+    fs: new LocalFileSystemDetector(cwd),
+    frameworkList: frameworks,
+  });
+
+  if (!detectedFramework) {
+    return;
+  }
+
+  // determine framework version from build result
+  if (detectedFramework.useRuntime) {
+    for (const [build, buildResult] of buildResults.entries()) {
+      if (
+        'framework' in buildResult &&
+        build.use === detectedFramework.useRuntime.use
+      ) {
+        return buildResult.framework;
+      }
+    }
+  }
+
+  // determine framework version from listed package.json version
+  if (detectedFramework.detectedVersion) {
+    // check for a valid, explicit version, not a range
+    if (semver.valid(detectedFramework.detectedVersion)) {
+      return {
+        version: detectedFramework.detectedVersion,
+      };
+    }
+  }
+
+  // determine framework version with runtime lookup
+  const frameworkVersion = detectFrameworkVersion(detectedFramework);
+  if (frameworkVersion) {
+    return {
+      version: frameworkVersion,
+    };
+  }
 }
 
 function expandBuild(files: string[], build: Builder): Builder[] {
@@ -488,7 +705,7 @@ function expandBuild(files: string[], build: Builder): Builder[] {
     throw new NowBuildError({
       code: `invalid_build_specification`,
       message: 'Field `use` is missing in build specification',
-      link: 'https://vercel.com/docs/configuration#project/builds',
+      link: 'https://vercel.com/docs/concepts/projects/project-configuration#builds',
       action: 'View Documentation',
     });
   }
@@ -498,7 +715,7 @@ function expandBuild(files: string[], build: Builder): Builder[] {
     throw new NowBuildError({
       code: `invalid_build_specification`,
       message: 'A build `src` path resolves to an empty string',
-      link: 'https://vercel.com/docs/configuration#project/builds',
+      link: 'https://vercel.com/docs/concepts/projects/project-configuration#builds',
       action: 'View Documentation',
     });
   }
@@ -522,19 +739,31 @@ function expandBuild(files: string[], build: Builder): Builder[] {
 }
 
 function mergeImages(
-  buildResults: Iterable<BuildResult>
+  images: BuildResultV2Typical['images'],
+  buildResults: Iterable<BuildResult | BuildOutputConfig>
 ): BuildResultV2Typical['images'] {
-  let images: BuildResultV2Typical['images'] = undefined;
   for (const result of buildResults) {
     if ('images' in result && result.images) {
-      images = Object.assign({} || images, result.images);
+      images = Object.assign({}, images, result.images);
     }
   }
   return images;
 }
 
+function mergeCrons(
+  crons: BuildOutputConfig['crons'] = [],
+  buildResults: Iterable<BuildResult | BuildOutputConfig>
+): BuildOutputConfig['crons'] {
+  for (const result of buildResults) {
+    if ('crons' in result && result.crons) {
+      crons = crons.concat(result.crons);
+    }
+  }
+  return crons;
+}
+
 function mergeWildcard(
-  buildResults: Iterable<BuildResult>
+  buildResults: Iterable<BuildResult | BuildOutputConfig>
 ): BuildResultV2Typical['wildcard'] {
   let wildcard: BuildResultV2Typical['wildcard'] = undefined;
   for (const result of buildResults) {
@@ -544,15 +773,4 @@ function mergeWildcard(
     }
   }
   return wildcard;
-}
-
-async function checkExists(paths: Iterable<string>) {
-  for (const path of paths) {
-    try {
-      await fs.stat(path);
-      return path;
-    } catch (err: any) {
-      if (err.code !== 'ENOENT') throw err;
-    }
-  }
 }
