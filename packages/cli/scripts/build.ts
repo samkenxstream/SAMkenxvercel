@@ -1,7 +1,7 @@
 import cpy from 'cpy';
 import execa from 'execa';
 import { join } from 'path';
-import { remove, writeFile } from 'fs-extra';
+import { remove, readJSON, writeFile } from 'fs-extra';
 
 const dirRoot = join(__dirname, '..');
 const distRoot = join(dirRoot, 'dist');
@@ -27,40 +27,38 @@ function envToString(key: string) {
 }
 
 async function main() {
-  const isDev = process.argv[2] === '--dev';
+  // Read the secrets from GitHub Actions and generate a file.
+  // During local development, these secrets will be empty.
+  await createConstants();
 
-  if (!isDev) {
-    // Read the secrets from GitHub Actions and generate a file.
-    // During local development, these secrets will be empty.
-    await createConstants();
+  // `vercel dev` uses chokidar to watch the filesystem, but opts-out of the
+  // `fsevents` feature using `useFsEvents: false`, so delete the module here so
+  // that it is not compiled by ncc, which makes the npm package size larger
+  // than necessary.
+  await remove(join(dirRoot, '../../node_modules/fsevents'));
 
-    // `vercel dev` uses chokidar to watch the filesystem, but opts-out of the
-    // `fsevents` feature using `useFsEvents: false`, so delete the module here so
-    // that it is not compiled by ncc, which makes the npm package size larger
-    // than necessary.
-    await remove(join(dirRoot, '../../node_modules/fsevents'));
-
-    // Compile the `doT.js` template files for `vercel dev`
-    console.log();
-    await execa(process.execPath, [join(__dirname, 'compile-templates.js')], {
-      stdio: 'inherit',
-    });
-  }
-
-  // Do the initial `ncc` build
+  // Compile the `doT.js` template files for `vercel dev`
   console.log();
-  const args = ['ncc', 'build', '--external', 'update-notifier'];
-  if (isDev) {
-    args.push('--source-map');
-  }
-  args.push('src/index.ts');
-  await execa('yarn', args, { stdio: 'inherit', cwd: dirRoot });
+  await execa(process.execPath, [join(__dirname, 'compile-templates.js')], {
+    stdio: 'inherit',
+  });
 
-  // `ncc` has some issues with `@zeit/fun`'s runtime files:
+  const pkg = await readJSON(join(dirRoot, 'package.json'));
+  const dependencies = Object.keys(pkg?.dependencies ?? {});
+  // Do the initial `ncc` build
+  console.log('Dependencies:', dependencies);
+  const externs: Array<string> = [];
+  for (const dep of dependencies) {
+    externs.push('--external', dep);
+  }
+  const args = ['ncc', 'build', 'src/index.ts', ...externs];
+  await execa('pnpm', args, { stdio: 'inherit', cwd: dirRoot });
+
+  // `ncc` has some issues with `@vercel/fun`'s runtime files:
   //   - Executable bits on the `bootstrap` files appear to be lost:
-  //       https://github.com/zeit/ncc/pull/182
+  //       https://github.com/vercel/ncc/pull/182
   //   - The `bootstrap.js` asset does not get copied into the output dir:
-  //       https://github.com/zeit/ncc/issues/278
+  //       https://github.com/vercel/ncc/issues/278
   //
   // Aside from those issues, all the same files from the `runtimes` directory
   // should be copied into the output runtimes dir, specifically the `index.js`
@@ -68,10 +66,7 @@ async function main() {
   // get compiled into the final ncc bundle file, however, we want them to be
   // present in the npm package because the contents of those files are involved
   // with `fun`'s cache invalidation mechanism and they need to be shasum'd.
-  const runtimes = join(
-    dirRoot,
-    '../../node_modules/@zeit/fun/dist/src/runtimes'
-  );
+  const runtimes = join(dirRoot, 'node_modules/@vercel/fun/dist/src/runtimes');
   await cpy('**/*', join(distRoot, 'runtimes'), {
     parents: true,
     cwd: runtimes,
@@ -79,6 +74,11 @@ async function main() {
 
   // Band-aid to bundle stuff that `ncc` neglects to bundle
   await cpy(join(dirRoot, 'src/util/projects/VERCEL_DIR_README.txt'), distRoot);
+  await cpy(join(dirRoot, 'src/util/dev/builder-worker.js'), distRoot);
+  await cpy(
+    join(dirRoot, 'src/util/get-latest-version/get-latest-worker.js'),
+    distRoot
+  );
 
   console.log('Finished building Vercel CLI');
 }

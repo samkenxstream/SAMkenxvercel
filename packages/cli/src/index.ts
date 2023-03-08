@@ -1,12 +1,13 @@
 #!/usr/bin/env node
+import { isErrnoException, isError, errorToString } from '@vercel/error-utils';
 
 try {
   // Test to see if cwd has been deleted before
   // importing 3rd party packages that might need cwd.
   process.cwd();
-} catch (e) {
-  if (e && e.message && e.message.includes('uv_cwd')) {
-    console.error('Error! The current working directory does not exist.');
+} catch (err: unknown) {
+  if (isError(err) && err.message.includes('uv_cwd')) {
+    console.error('Error: The current working directory does not exist.');
     process.exit(1);
   }
 }
@@ -17,7 +18,7 @@ import sourceMap from '@zeit/source-map-support';
 import { mkdirp } from 'fs-extra';
 import chalk from 'chalk';
 import epipebomb from 'epipebomb';
-import updateNotifier from 'update-notifier';
+import getLatestVersion from './util/get-latest-version';
 import { URL } from 'url';
 import * as Sentry from '@sentry/node';
 import hp from './util/humanize-path';
@@ -39,8 +40,8 @@ import getConfig from './util/get-config';
 import * as configFiles from './util/config/files';
 import getGlobalPathConfig from './util/config/global-path';
 import {
-  getDefaultConfig,
-  getDefaultAuthConfig,
+  defaultAuthConfig,
+  defaultGlobalConfig,
 } from './util/config/get-default';
 import * as ERRORS from './util/errors-ts';
 import { APIError } from './util/errors-ts';
@@ -49,17 +50,11 @@ import getUpdateCommand from './util/get-update-command';
 import { metrics, shouldCollectMetrics } from './util/metrics';
 import { getCommandName, getTitleName } from './util/pkg-name';
 import doLoginPrompt from './util/login/prompt';
-import { GlobalConfig } from './types';
+import { AuthConfig, GlobalConfig } from '@vercel-internals/types';
 import { VercelConfig } from '@vercel/client';
+import box from './util/output/box';
 
 const isCanary = pkg.version.includes('canary');
-
-// Checks for available update and returns an instance
-const notifier = updateNotifier({
-  pkg,
-  distTag: isCanary ? 'canary' : 'latest',
-  updateCheckInterval: 1000 * 60 * 60 * 24 * 7, // 1 week
-});
 
 const VERCEL_DIR = getGlobalPathConfig();
 const VERCEL_CONFIG_PATH = configFiles.getConfigFilePath();
@@ -79,11 +74,12 @@ Sentry.init({
 });
 
 let client: Client;
+let output: Output;
+let { isTTY } = process.stdout;
 let debug: (s: string) => void = () => {};
 let apiUrl = 'https://api.vercel.com';
 
 const main = async () => {
-  let { isTTY } = process.stdout;
   if (process.env.FORCE_TTY === '1') {
     isTTY = true;
     process.stdout.isTTY = true;
@@ -103,13 +99,18 @@ const main = async () => {
       },
       { permissive: true }
     );
-  } catch (err) {
+  } catch (err: unknown) {
     handleError(err);
     return 1;
   }
 
   const isDebugging = argv['--debug'];
-  const output = new Output(process.stderr, { debug: isDebugging });
+  const isNoColor = argv['--no-color'];
+
+  output = new Output(process.stderr, {
+    debug: isDebugging,
+    noColor: isNoColor,
+  });
 
   debug = output.debug;
 
@@ -147,32 +148,14 @@ const main = async () => {
     process.chdir(cwd);
   }
 
-  // Print update information, if available
-  if (notifier.update && notifier.update.latest !== pkg.version && isTTY) {
-    const { latest } = notifier.update;
-    console.log(
-      info(
-        `${chalk.black.bgCyan('UPDATE AVAILABLE')} ` +
-          `Run ${cmd(
-            await getUpdateCommand()
-          )} to install ${getTitleName()} CLI ${latest}`
-      )
-    );
-
-    console.log(
-      info(
-        `Changelog: https://github.com/vercel/vercel/releases/tag/vercel@${latest}`
-      )
-    );
-  }
-
   // The second argument to the command can be:
   //
   //  * a path to deploy (as in: `vercel path/`)
   //  * a subcommand (as in: `vercel ls`)
   const targetOrSubcommand = argv._[2];
 
-  const betaCommands: string[] = ['build'];
+  // Currently no beta commands - add here as needed
+  const betaCommands: string[] = ['rollback'];
   if (betaCommands.includes(targetOrSubcommand)) {
     console.log(
       `${chalk.grey(
@@ -200,169 +183,65 @@ const main = async () => {
   // Ensure that the Vercel global configuration directory exists
   try {
     await mkdirp(VERCEL_DIR);
-  } catch (err) {
-    console.error(
-      error(
-        `${
-          'An unexpected error occurred while trying to create the ' +
-          `global directory "${hp(VERCEL_DIR)}" `
-        }${err.message}`
-      )
+  } catch (err: unknown) {
+    output.error(
+      `An unexpected error occurred while trying to create the global directory "${hp(
+        VERCEL_DIR
+      )}" ${errorToString(err)}`
     );
-  }
-
-  let migrated = false;
-  let configExists;
-
-  try {
-    configExists = existsSync(VERCEL_CONFIG_PATH);
-  } catch (err) {
-    console.error(
-      error(
-        `${
-          'An unexpected error occurred while trying to find the ' +
-          `config file "${hp(VERCEL_CONFIG_PATH)}" `
-        }${err.message}`
-      )
-    );
-
-    return 0;
-  }
-
-  let config: GlobalConfig | null = null;
-
-  if (configExists) {
-    try {
-      config = configFiles.readConfigFile();
-    } catch (err) {
-      console.error(
-        error(
-          `${
-            'An unexpected error occurred while trying to read the ' +
-            `config in "${hp(VERCEL_CONFIG_PATH)}" `
-          }${err.message}`
-        )
-      );
-
-      return 1;
-    }
-
-    // This is from when Vercel CLI supported
-    // multiple providers. In that case, we really
-    // need to migrate.
-    if (
-      // @ts-ignore
-      config.sh ||
-      // @ts-ignore
-      config.user ||
-      // @ts-ignore
-      typeof config.user === 'object' ||
-      typeof config.currentTeam === 'object'
-    ) {
-      configExists = false;
-    }
-  }
-
-  if (!configExists) {
-    const results = await getDefaultConfig(config);
-
-    config = results.config;
-    migrated = results.migrated;
-
-    try {
-      configFiles.writeToConfigFile(config);
-    } catch (err) {
-      console.error(
-        error(
-          `${
-            'An unexpected error occurred while trying to write the ' +
-            `default config to "${hp(VERCEL_CONFIG_PATH)}" `
-          }${err.message}`
-        )
-      );
-
-      return 1;
-    }
-  }
-
-  let authConfigExists;
-
-  try {
-    authConfigExists = existsSync(VERCEL_AUTH_CONFIG_PATH);
-  } catch (err) {
-    console.error(
-      error(
-        `${
-          'An unexpected error occurred while trying to find the ' +
-          `auth file "${hp(VERCEL_AUTH_CONFIG_PATH)}" `
-        }${err.message}`
-      )
-    );
-
     return 1;
   }
 
-  let authConfig = null;
-
-  const subcommandsWithoutToken = [
-    'login',
-    'logout',
-    'help',
-    'init',
-    'update',
-    'build',
-  ];
-
-  if (authConfigExists) {
-    try {
-      authConfig = configFiles.readAuthConfigFile();
-    } catch (err) {
-      console.error(
-        error(
-          `${
-            'An unexpected error occurred while trying to read the ' +
-            `auth config in "${hp(VERCEL_AUTH_CONFIG_PATH)}" `
-          }${err.message}`
-        )
-      );
-
-      return 1;
-    }
-
-    // This is from when Vercel CLI supported
-    // multiple providers. In that case, we really
-    // need to migrate.
-    // @ts-ignore
-    if (authConfig.credentials) {
-      authConfigExists = false;
-    }
-  } else {
-    const results = await getDefaultAuthConfig(authConfig);
-
-    authConfig = results.config;
-    migrated = results.migrated;
-
-    try {
-      configFiles.writeToAuthConfigFile(authConfig);
-    } catch (err) {
-      console.error(
-        error(
-          `${
-            'An unexpected error occurred while trying to write the ' +
-            `default config to "${hp(VERCEL_AUTH_CONFIG_PATH)}" `
-          }${err.message}`
-        )
+  let config: GlobalConfig;
+  try {
+    config = configFiles.readConfigFile();
+  } catch (err: unknown) {
+    if (isErrnoException(err) && err.code === 'ENOENT') {
+      config = defaultGlobalConfig;
+      try {
+        configFiles.writeToConfigFile(config);
+      } catch (err: unknown) {
+        output.error(
+          `An unexpected error occurred while trying to save the config to "${hp(
+            VERCEL_CONFIG_PATH
+          )}" ${errorToString(err)}`
+        );
+        return 1;
+      }
+    } else {
+      output.error(
+        `An unexpected error occurred while trying to read the config in "${hp(
+          VERCEL_CONFIG_PATH
+        )}" ${errorToString(err)}`
       );
       return 1;
     }
   }
 
-  // Let the user know we migrated the config
-  if (migrated) {
-    const directory = param(hp(VERCEL_DIR));
-    debug(
-      `The credentials and configuration within the ${directory} directory were upgraded`
-    );
+  let authConfig: AuthConfig;
+  try {
+    authConfig = configFiles.readAuthConfigFile();
+  } catch (err: unknown) {
+    if (isErrnoException(err) && err.code === 'ENOENT') {
+      authConfig = defaultAuthConfig;
+      try {
+        configFiles.writeToAuthConfigFile(authConfig);
+      } catch (err: unknown) {
+        output.error(
+          `An unexpected error occurred while trying to write the auth config to "${hp(
+            VERCEL_AUTH_CONFIG_PATH
+          )}" ${errorToString(err)}`
+        );
+        return 1;
+      }
+    } else {
+      output.error(
+        `An unexpected error occurred while trying to read the auth config in "${hp(
+          VERCEL_AUTH_CONFIG_PATH
+        )}" ${errorToString(err)}`
+      );
+      return 1;
+    }
   }
 
   if (typeof argv['--api'] === 'string') {
@@ -372,15 +251,9 @@ const main = async () => {
   }
 
   try {
-    // eslint-disable-next-line no-new
     new URL(apiUrl);
-  } catch (err) {
+  } catch (err: unknown) {
     output.error(`Please provide a valid URL instead of ${highlight(apiUrl)}.`);
-    return 1;
-  }
-
-  if (!config) {
-    output.error(`Vercel global config was not loaded.`);
     return 1;
   }
 
@@ -430,6 +303,8 @@ const main = async () => {
     subcommand = argv._[3] || 'deploy';
     client.argv.push('-h');
   }
+
+  const subcommandsWithoutToken = ['login', 'logout', 'help', 'init', 'build'];
 
   // Prompt for login if there is no current token
   if (
@@ -542,8 +417,8 @@ const main = async () => {
 
     try {
       user = await getUser(client);
-    } catch (err) {
-      if (err.code === 'NOT_AUTHORIZED') {
+    } catch (err: unknown) {
+      if (isErrnoException(err) && err.code === 'NOT_AUTHORIZED') {
         output.prettyError({
           message: `You do not have access to the specified account`,
           link: 'https://err.sh/vercel/scope-not-accessible',
@@ -563,8 +438,8 @@ const main = async () => {
 
       try {
         teams = await getTeams(client);
-      } catch (err) {
-        if (err.code === 'not_authorized') {
+      } catch (err: unknown) {
+        if (isErrnoException(err) && err.code === 'not_authorized') {
           output.prettyError({
             message: `You do not have access to the specified team`,
             link: 'https://err.sh/vercel/scope-not-accessible',
@@ -593,8 +468,8 @@ const main = async () => {
     }
   }
 
-  const metric = metrics();
   let exitCode;
+  let metric: ReturnType<typeof metrics> | undefined;
   const eventCategory = 'Exit Code';
 
   try {
@@ -603,9 +478,6 @@ const main = async () => {
     switch (targetCommand) {
       case 'alias':
         func = require('./commands/alias').default;
-        break;
-      case 'billing':
-        func = require('./commands/billing').default;
         break;
       case 'bisect':
         func = require('./commands/bisect').default;
@@ -631,6 +503,9 @@ const main = async () => {
       case 'env':
         func = require('./commands/env').default;
         break;
+      case 'git':
+        func = require('./commands/git').default;
+        break;
       case 'init':
         func = require('./commands/init').default;
         break;
@@ -652,8 +527,8 @@ const main = async () => {
       case 'logout':
         func = require('./commands/logout').default;
         break;
-      case 'projects':
-        func = require('./commands/projects').default;
+      case 'project':
+        func = require('./commands/project').default;
         break;
       case 'pull':
         func = require('./commands/pull').default;
@@ -661,14 +536,14 @@ const main = async () => {
       case 'remove':
         func = require('./commands/remove').default;
         break;
+      case 'rollback':
+        func = require('./commands/rollback').default;
+        break;
       case 'secrets':
         func = require('./commands/secrets').default;
         break;
       case 'teams':
         func = require('./commands/teams').default;
-        break;
-      case 'update':
-        func = require('./commands/update').default;
         break;
       case 'whoami':
         func = require('./commands/whoami').default;
@@ -694,13 +569,14 @@ const main = async () => {
     if (shouldCollectMetrics) {
       const category = 'Command Invocation';
 
+      if (!metric) metric = metrics();
       metric
         .timing(category, targetCommand, end, pkg.version)
         .event(category, targetCommand, pkg.version)
         .send();
     }
-  } catch (err) {
-    if (err.code === 'ENOTFOUND') {
+  } catch (err: unknown) {
+    if (isErrnoException(err) && err.code === 'ENOTFOUND') {
       // Error message will look like the following:
       // "request to https://api.vercel.com/v2/user failed, reason: getaddrinfo ENOTFOUND api.vercel.com"
       const matches = /getaddrinfo ENOTFOUND (.*)$/.exec(err.message || '');
@@ -712,11 +588,31 @@ const main = async () => {
           )} could not be resolved. Please verify your internet connectivity and DNS configuration.`
         );
       }
-      output.debug(err.stack);
+      if (typeof err.stack === 'string') {
+        output.debug(err.stack);
+      }
       return 1;
     }
 
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
+    if (isErrnoException(err) && err.code === 'ECONNRESET') {
+      // Error message will look like the following:
+      // request to https://api.vercel.com/v2/user failed, reason: socket hang up
+      const matches = /request to https:\/\/(.*?)\//.exec(err.message || '');
+      const hostname = matches?.[1];
+      if (hostname) {
+        output.error(
+          `Connection to ${highlight(
+            hostname
+          )} interrupted. Please verify your internet connectivity and DNS configuration.`
+        );
+      }
+      return 1;
+    }
+
+    if (
+      isErrnoException(err) &&
+      (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED')
+    ) {
       output.prettyError(err);
       return 1;
     }
@@ -728,9 +624,10 @@ const main = async () => {
     }
 
     if (shouldCollectMetrics) {
+      if (!metric) metric = metrics();
       metric
         .event(eventCategory, '1', pkg.version)
-        .exception(err.message)
+        .exception(errorToString(err))
         .send();
     }
 
@@ -738,23 +635,24 @@ const main = async () => {
     // but instead show the message. Any error that is handled by this should
     // actually be handled in the sub command instead. Please make sure
     // that happens for anything that lands here. It should NOT bubble up to here.
-    if (err.code) {
-      output.debug(err.stack);
+    if (isErrnoException(err)) {
+      if (typeof err.stack === 'string') {
+        output.debug(err.stack);
+      }
       output.prettyError(err);
     } else {
       await reportError(Sentry, client, err);
 
       // Otherwise it is an unexpected error and we should show the trace
       // and an unexpected error message
-      output.error(
-        `An unexpected error occurred in ${subcommand}: ${err.stack}`
-      );
+      output.error(`An unexpected error occurred in ${subcommand}: ${err}`);
     }
 
     return 1;
   }
 
   if (shouldCollectMetrics) {
+    if (!metric) metric = metrics();
     metric.event(eventCategory, `${exitCode}`, pkg.version).send();
   }
 
@@ -797,7 +695,39 @@ process.on('unhandledRejection', handleRejection);
 process.on('uncaughtException', handleUnexpected);
 
 main()
-  .then(exitCode => {
+  .then(async exitCode => {
+    // Print update information, if available
+    if (isTTY && !process.env.NO_UPDATE_NOTIFIER) {
+      // Check if an update is available. If so, `latest` will contain a string
+      // of the latest version, otherwise `undefined`.
+      const latest = getLatestVersion({
+        distTag: isCanary ? 'canary' : 'latest',
+        output,
+        pkg,
+      });
+      if (latest) {
+        const changelog = 'https://github.com/vercel/vercel/releases';
+        const errorMsg =
+          exitCode && exitCode !== 2
+            ? chalk.magenta(
+                `\n\nThe latest update ${chalk.italic(
+                  'may'
+                )} fix any errors that occurred.`
+              )
+            : '';
+        output.print(
+          box(
+            `Update available! ${chalk.gray(`v${pkg.version}`)} ≫ ${chalk.green(
+              `v${latest}`
+            )}
+Changelog: ${output.link(changelog, changelog, { fallback: false })}
+Run ${chalk.cyan(cmd(await getUpdateCommand()))} to update.${errorMsg}`
+          )
+        );
+        output.print('\n\n');
+      }
+    }
+
     process.exitCode = exitCode;
   })
   .catch(handleUnexpected);

@@ -1,12 +1,19 @@
+// @ts-check
 const child_process = require('child_process');
 const path = require('path');
 
-const NUMBER_OF_CHUNKS = 5;
-const MINIMUM_PER_CHUNK = 1;
 const runnersMap = new Map([
-  ['test-integration-once', ['ubuntu-latest']],
-  ['test-next-local', ['ubuntu-latest']],
-  ['test-integration-dev', ['ubuntu-latest', 'macos-latest']],
+  [
+    'test-unit',
+    {
+      min: 1,
+      max: 1,
+      runners: ['ubuntu-latest', 'macos-latest', 'windows-latest'],
+    },
+  ],
+  ['test-e2e', { min: 1, max: 5, runners: ['ubuntu-latest'] }],
+  ['test-next-local', { min: 1, max: 5, runners: ['ubuntu-latest'] }],
+  ['test-dev', { min: 1, max: 5, runners: ['ubuntu-latest', 'macos-latest'] }],
 ]);
 
 async function getChunkedTests() {
@@ -14,7 +21,15 @@ async function getChunkedTests() {
   const rootPath = path.resolve(__dirname, '..');
 
   const dryRunText = (
-    await turbo([`run`, ...scripts, `--cache-dir=.turbo`, '--', '--listTests'])
+    await turbo([
+      `run`,
+      ...scripts,
+      `--cache-dir=.turbo`,
+      '--output-logs=full',
+      '--',
+      '--', // need two of these due to pnpm arg parsing
+      '--listTests',
+    ])
   ).toString('utf8');
 
   /**
@@ -52,10 +67,14 @@ async function getChunkedTests() {
     ([packagePathAndName, scriptNames]) => {
       const [packagePath, packageName] = packagePathAndName.split(',');
       return Object.entries(scriptNames).flatMap(([scriptName, testPaths]) => {
-        return intoChunks(NUMBER_OF_CHUNKS, testPaths).flatMap(
+        const {
+          runners = ['ubuntu-latest'],
+          min = 1,
+          max = 1,
+        } = runnersMap.get(scriptName) || {};
+        const sortedTestPaths = testPaths.sort((a, b) => a.localeCompare(b));
+        return intoChunks(min, max, sortedTestPaths).flatMap(
           (chunk, chunkNumber, allChunks) => {
-            const runners = runnersMap.get(scriptName) || ['ubuntu-latest'];
-
             return runners.map(runner => {
               return {
                 runner,
@@ -81,16 +100,19 @@ async function getChunkedTests() {
   return chunkedTests;
 }
 
+/**
+ * Run turbo cli
+ * @param {string[]} args
+ */
 async function turbo(args) {
   const chunks = [];
   try {
     await new Promise((resolve, reject) => {
-      const spawned = child_process.spawn(`yarn`, ['turbo', '--', ...args], {
-        cwd: path.resolve(__dirname, '..'),
-        env: {
-          ...process.env,
-          YARN_SILENT: '1',
-        },
+      const root = path.resolve(__dirname, '..');
+      const turbo = path.join(root, 'node_modules', '.bin', 'turbo');
+      const spawned = child_process.spawn(turbo, args, {
+        cwd: root,
+        env: process.env,
       });
       spawned.stdout.on('data', data => {
         chunks.push(data);
@@ -103,7 +125,7 @@ async function turbo(args) {
         if (code !== 0) {
           reject(new Error(`Turbo exited with code ${code}`));
         } else {
-          resolve();
+          resolve(code);
         }
       });
     });
@@ -116,17 +138,15 @@ async function turbo(args) {
 
 /**
  * @template T
- * @param {number} totalChunks maximum number of chunks
- * @param {T[]} values
+ * @param {number} minChunks minimum number of chunks
+ * @param {number} maxChunks maximum number of chunks
+ * @param {T[]} arr
  * @returns {T[][]}
  */
-function intoChunks(totalChunks, arr) {
-  const chunkSize = Math.max(
-    MINIMUM_PER_CHUNK,
-    Math.ceil(arr.length / totalChunks)
-  );
+function intoChunks(minChunks, maxChunks, arr) {
+  const chunkSize = Math.max(minChunks, Math.ceil(arr.length / maxChunks));
   const chunks = [];
-  for (let i = 0; i < totalChunks; i++) {
+  for (let i = 0; i < maxChunks; i++) {
     chunks.push(arr.slice(i * chunkSize, (i + 1) * chunkSize));
   }
   return chunks.filter(x => x.length > 0);
@@ -134,7 +154,7 @@ function intoChunks(totalChunks, arr) {
 
 async function main() {
   try {
-    const chunks = await getChunkedTests(process.argv[2]);
+    const chunks = await getChunkedTests();
     // TODO: pack and build the runtimes for each package and cache it so we only deploy it once
     console.log(JSON.stringify(chunks));
   } catch (e) {
@@ -149,5 +169,4 @@ if (module === require.main || !module.parent) {
 
 module.exports = {
   intoChunks,
-  NUMBER_OF_CHUNKS,
 };

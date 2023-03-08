@@ -1,47 +1,35 @@
 {
   "$schema": "https://turborepo.org/schema.json",
-  "baseBranch": "origin/main",
-  "globalDependencies": ["$RUNNER_OS"],
+  "globalDependencies": ["turbo-cache-key.json", "test/lib/**"],
   "pipeline": {
     "build": {
       "dependsOn": ["^build"],
+      "outputMode": "new-only",
       "outputs": ["dist/**"]
-    },
-    "@vercel/node-bridge#build": {
-      "dependsOn": ["^build"],
-      "outputs": ["helpers.js", "source-map-support.js"]
-    },
-    "vercel#build": {
-      "dependsOn": ["^build"],
-      "outputs": [
-        "dist/**",
-        "src/util/constants.ts",
-        "src/util/dev/templates/*.ts"
-      ]
     },
     "test-unit": {
       "dependsOn": ["build"],
-      "outputs": []
+      "outputMode": "new-only"
     },
-    "test-integration-dev": {
+    "test-dev": {
       "dependsOn": ["build"],
-      "outputs": []
+      "outputMode": "new-only"
     },
-    "test-integration-cli": {
+    "test-cli": {
       "dependsOn": ["build"],
-      "outputs": []
+      "outputMode": "new-only"
     },
-    "test-integration-once": {
+    "test-e2e": {
       "dependsOn": ["build"],
-      "outputs": []
+      "outputMode": "new-only"
     },
     "test-next-local": {
       "dependsOn": ["build"],
-      "outputs": []
+      "outputMode": "new-only"
     },
     "test": {
       "dependsOn": ["build"],
-      "outputs": []
+      "outputMode": "new-only"
     }
   }
 }
