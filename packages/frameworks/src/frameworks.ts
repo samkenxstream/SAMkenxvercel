@@ -199,7 +199,7 @@ export const frameworks = [
     description: 'A new Remix app — the result of running `npx create-remix`.',
     website: 'https://remix.run',
     sort: 6,
-    useRuntime: { src: 'package.json', use: '@vercel/remix' },
+    useRuntime: { src: 'package.json', use: '@vercel/remix-builder' },
     ignoreRuntimes: ['@vercel/node'],
     detectors: {
       some: [
@@ -1931,6 +1931,39 @@ export const frameworks = [
         dest: '/index.html',
       },
     ],
+  },
+  {
+    name: 'Storybook',
+    slug: 'storybook',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/storybook.svg',
+    tagline: 'Frontend workshop for UI development',
+    description:
+      'Storybook is a frontend workshop for building UI components and pages in isolation.',
+    website: 'https://storybook.js.org',
+    ignoreRuntimes: ['@vercel/next', '@vercel/node'],
+    disableRootMiddleware: true,
+    detectors: {
+      every: [
+        {
+          matchPackage: 'storybook',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder: '`yarn install`, `pnpm install`, or `npm install`',
+      },
+      buildCommand: {
+        value: 'storybook build',
+      },
+      devCommand: {
+        value: `storybook dev -p $PORT`,
+      },
+      outputDirectory: {
+        value: 'storybook-static',
+      },
+    },
+    getOutputDirName: async () => 'storybook-static',
   },
   {
     name: 'Other',

@@ -795,7 +795,7 @@ export async function createLambdaFromPseudoLayers({
     ...lambdaOptions,
     ...(isStreaming
       ? {
-          experimentalResponseStreaming: true,
+          supportsResponseStreaming: true,
         }
       : {}),
     files,
@@ -1242,28 +1242,34 @@ async function getSourceFilePathFromPage({
   // value used during next build
   const extensionsToTry = pageExtensions || ['js', 'jsx', 'ts', 'tsx'];
 
-  let fsPath = path.join(workPath, 'pages', page);
-  if (await usesSrcDirectory(workPath)) {
-    fsPath = path.join(workPath, 'src', 'pages', page);
-  }
+  for (const pageType of ['pages', 'app']) {
+    let fsPath = path.join(workPath, pageType, page);
+    if (await usesSrcDirectory(workPath)) {
+      fsPath = path.join(workPath, 'src', pageType, page);
+    }
 
-  if (fs.existsSync(fsPath)) {
-    return path.relative(workPath, fsPath);
-  }
-  const extensionless = fsPath.slice(0, -3); // remove ".js"
-
-  for (const ext of extensionsToTry) {
-    fsPath = `${extensionless}.${ext}`;
     if (fs.existsSync(fsPath)) {
       return path.relative(workPath, fsPath);
     }
-  }
+    const extensionless = fsPath.replace(path.extname(fsPath), '');
 
-  if (isDirectory(extensionless)) {
     for (const ext of extensionsToTry) {
-      fsPath = path.join(extensionless, `index.${ext}`);
+      fsPath = `${extensionless}.${ext}`;
       if (fs.existsSync(fsPath)) {
         return path.relative(workPath, fsPath);
+      }
+    }
+
+    if (isDirectory(extensionless)) {
+      for (const ext of extensionsToTry) {
+        fsPath = path.join(extensionless, `index.${ext}`);
+        if (fs.existsSync(fsPath)) {
+          return path.relative(workPath, fsPath);
+        }
+        fsPath = path.join(extensionless, `route.${ext}`);
+        if (fs.existsSync(fsPath)) {
+          return path.relative(workPath, fsPath);
+        }
       }
     }
   }
@@ -2074,6 +2080,11 @@ export const onPrerenderRoute =
       const rscContentTypeHeader =
         routesManifest?.rsc?.contentTypeHeader || 'text/x-component';
 
+      let sourcePath: string | undefined;
+      if (`/${outputPathPage}` !== srcRoute && srcRoute) {
+        sourcePath = srcRoute;
+      }
+
       prerenders[outputPathPage] = new Prerender({
         expiration: initialRevalidate,
         lambda,
@@ -2083,6 +2094,7 @@ export const onPrerenderRoute =
         bypassToken: prerenderManifest.bypassToken,
         initialStatus,
         initialHeaders,
+        sourcePath,
 
         ...(isNotFound
           ? {
@@ -2340,6 +2352,8 @@ interface MiddlewareManifestV2 {
   functions?: { [page: string]: EdgeFunctionInfoV2 };
 }
 
+type Regions = 'home' | 'global' | 'auto' | string[] | 'all' | 'default';
+
 interface BaseEdgeFunctionInfo {
   env: string[];
   files: string[];
@@ -2347,7 +2361,7 @@ interface BaseEdgeFunctionInfo {
   page: string;
   wasm?: { filePath: string; name: string }[];
   assets?: { filePath: string; name: string }[];
-  regions?: 'auto' | string[] | 'all' | 'default';
+  regions?: Regions;
 }
 
 interface EdgeFunctionInfoV1 extends BaseEdgeFunctionInfo {
@@ -2365,6 +2379,59 @@ interface EdgeFunctionMatcher {
   originalSource?: string;
 }
 
+const vercelFunctionRegionsVar = process.env.VERCEL_FUNCTION_REGIONS;
+let vercelFunctionRegions: string[] | undefined;
+if (vercelFunctionRegionsVar) {
+  vercelFunctionRegions = vercelFunctionRegionsVar.split(',');
+}
+
+/**
+ * Normalizes the regions config that comes from the Next.js edge functions manifest.
+ * Ensures that config like `home` and `global` are converted to the corresponding Vercel region config.
+ * In the future we'll want to make `home` and `global` part of the Build Output API.
+ * - `home` refers to the regions set in vercel.json or on the Vercel dashboard project config.
+ * - `global` refers to all regions.
+ */
+function normalizeRegions(regions: Regions): undefined | string | string[] {
+  if (typeof regions === 'string') {
+    regions = [regions];
+  }
+
+  const newRegions: string[] = [];
+  for (const region of regions) {
+    // Explicitly mentioned as `home` is one of the explicit values for preferredRegion in Next.js.
+    if (region === 'home') {
+      if (vercelFunctionRegions) {
+        // Includes the regions from the VERCEL_FUNCTION_REGIONS env var.
+        newRegions.push(...vercelFunctionRegions);
+      }
+      continue;
+    }
+
+    // Explicitly mentioned as `global` is one of the explicit values for preferredRegion in Next.js.
+    if (region === 'global') {
+      // Uses `all` instead as that's how it's implemented on Vercel.
+      // Returns here as when all is provided all regions will be matched.
+      return 'all';
+    }
+
+    // Explicitly mentioned as `auto` is one of the explicit values for preferredRegion in Next.js.
+    if (region === 'auto') {
+      // Returns here as when auto is provided all regions will be matched.
+      return 'auto';
+    }
+
+    newRegions.push(region);
+  }
+
+  // Ensure we don't pass an empty array as that is not supported.
+  if (newRegions.length === 0) {
+    return undefined;
+  }
+
+  return newRegions;
+}
+
 export async function getMiddlewareBundle({
   entryPath,
   outputDirectory,
@@ -2372,6 +2439,7 @@ export async function getMiddlewareBundle({
   isCorrectMiddlewareOrder,
   prerenderBypassToken,
   nextVersion,
+  appPathRoutesManifest,
 }: {
   config: Config;
   entryPath: string;
@@ -2380,6 +2448,7 @@ export async function getMiddlewareBundle({
   routesManifest: RoutesManifest;
   isCorrectMiddlewareOrder: boolean;
   nextVersion: string;
+  appPathRoutesManifest: Record<string, string>;
 }): Promise<{
   staticRoutes: Route[];
   dynamicRouteMap: Map<string, RouteWithSrc>;
@@ -2492,7 +2561,9 @@ export async function getMiddlewareBundle({
                   ...wasmFiles,
                   ...assetFiles,
                 },
-                regions: edgeFunction.regions,
+                regions: edgeFunction.regions
+                  ? normalizeRegions(edgeFunction.regions)
+                  : undefined,
                 entrypoint: 'index.js',
                 envVarsInUse: edgeFunction.env,
                 assets: (edgeFunction.assets ?? []).map(({ name }) => {
@@ -2544,9 +2615,15 @@ export async function getMiddlewareBundle({
         shortPath.startsWith('app/') &&
         (shortPath.endsWith('/page') || shortPath.endsWith('/route'))
       ) {
-        shortPath =
-          shortPath.replace(/^app\//, '').replace(/(^|\/)(page|route)$/, '') ||
-          'index';
+        const ogRoute = shortPath.replace(/^app\//, '/');
+        shortPath = (
+          appPathRoutesManifest[ogRoute] ||
+          shortPath.replace(/(^|\/)(page|route)$/, '')
+        ).replace(/^\//, '');
+
+        if (!shortPath || shortPath === '/') {
+          shortPath = 'index';
+        }
       }
 
       if (routesManifest?.basePath) {
@@ -2770,7 +2847,7 @@ export function getOperationType({
     }
   }
 
-  return 'SSR';
+  return 'Page'; // aka SSR
 }
 
 export function isApiPage(page: string | undefined) {
