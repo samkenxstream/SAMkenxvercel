@@ -2,10 +2,27 @@
   "builds": [
     {
       "src": "package.json",
-      "use": "@vercel/next"
+      "use": "@vercel/next",
+      "config": {
+        "functions": {
+          "app/api/**/*": {
+            "maxDuration": 5,
+            "memory": 512
+          },
+          "pages/api/**/*": {
+            "maxDuration": 5,
+            "memory": 512
+          }
+        }
+      }
     }
   ],
   "probes": [
+    {
+      "path": "/dashboard/another-edge",
+      "status": 200,
+      "mustContain": "hello from newroot/dashboard/another"
+    },
     {
       "path": "/dynamic/category-1/id-1",
       "status": 200,
