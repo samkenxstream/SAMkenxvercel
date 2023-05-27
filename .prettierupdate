@@ -1,6 +1,6 @@
 # https://prettier.io/docs/en/ignore.html
 
-# ignore these files with an intentional syntax error
+# Update these files with an intentional syntax error
 packages/cli/test/dev/fixtures/edge-function-error/api/edge-error-syntax.js
 packages/cli/test/fixtures/unit/commands/build/node-error/api/typescript.ts
 examples/sveltekit-1
@@ -8,7 +8,7 @@ examples/sveltekit-1
 # gatsby-plugin-vercel-analytics
 packages/gatsby-plugin-vercel-analytics
 
-# ignore directories that are not source code
+# update directories that are not source code
 node_modules
 dist
 pnpm-lock.yaml
