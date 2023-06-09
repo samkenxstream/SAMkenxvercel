@@ -3,7 +3,7 @@
   "description": "A simple starter to get up and developing quickly with Gatsby",
   "version": "0.1.0",
   "dependencies": {
-    "gatsby": "^2.24.91",
+    "gatsby": "^4.25.7",
     "prop-types": "^15.7.2",
     "react": "^16.12.0",
     "react-dom": "^16.12.0"
